@@ -1,0 +1,29 @@
+{
+  "tag": "perf_g5_b32",
+  "results": {
+    "gsm8k": {
+      "baseline_chain": {
+        "mean_alpha": 3.9724358974358975,
+        "tokens_per_sec": 21.151052530654095,
+        "total_time": 366.7429783344269
+      },
+      "tree": {
+        "mean_alpha": 3.966580976863753,
+        "tokens_per_sec": 25.184469893237726,
+        "total_time": 306.85577392578125,
+        "draft_time": 255.92331862449646,
+        "target_time": 50.93245530128479,
+        "draft_fraction": 0.8340182599477377,
+        "gamma": 5,
+        "top_k": [
+          3,
+          2,
+          1,
+          1,
+          1
+        ],
+        "budget": 32
+      }
+    }
+  }
+}

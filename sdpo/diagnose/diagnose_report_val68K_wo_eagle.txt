@@ -1,0 +1,240 @@
+
+======================================================================
+ANALYSIS
+======================================================================
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 1: Four-Quadrant Matrix (per step)  │
+└─────────────────────────────────────────────────┘
+step     A(keep)  B(degrade)      C(fix)  D(still_wrong)  net(C-B)
+----------------------------------------------------------------------
+   0       13020         450         306            2677      -144
+   1       12495         421         349            3188       -72
+   2       12106         449         358            3540       -91
+   3       11884         426         352            3791       -74
+   4       11615         441         331            4066      -110
+   5       11389         415         342            4307       -73
+   6       11179         421         327            4526       -94
+----------------------------------------------------------------------
+ ALL       83688        3023        2365           26095      -658
+
+  A(keep):       72.7%
+  B(degrade):    2.6%
+  C(fix):        2.1%
+  D(still_wrong):22.7%
+  Net effect:    C-B = -658 positions
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 2: Logit Gap at First Rejection     │
+└─────────────────────────────────────────────────┘
+  Paired positions: 29493
+
+  Baseline gap:  mean=3.443, median=1.943
+  Trained gap:   mean=3.516, median=2.140
+  Gap delta:     mean=0.073, median=0.053
+  Positions where gap shrank:   13735/29493 (46.6%)
+  Positions where gap grew:     15758/29493 (53.4%)
+  Positions where argmax flipped (gap<0 after): 2539/29493 (8.6%)
+
+  Baseline target rank: mean=1042.9, median=4
+  Trained target rank:  mean=883.1, median=4
+
+  Baseline gap distribution:
+      gap<0 (already correct): 0 (0.0%)
+      0<gap<1 (close): 8872 (30.1%)
+      1<gap<3 (medium): 9486 (32.2%)
+      3<gap<5 (hard): 4359 (14.8%)
+      gap>5 (very hard): 6776 (23.0%)
+
+  Among 'close' positions (baseline gap<1): 2369/8872 flipped to correct
+
+  Target token logit change:
+    mean delta: -0.1145
+    positions where target logit increased: 13471/29493 (45.7%)
+    positions where target logit decreased: 16022/29493 (54.3%)
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 3: τ Change by Baseline τ Bucket    │
+└─────────────────────────────────────────────────┘
+bl_τ   count   bl_mean   tr_mean     delta  improved  degraded      same
+--------------------------------------------------------------------------------
+   0    2983       0.0      0.37     +0.37       306         0      2677
+   1    2741       1.0      1.30     +0.30       282       109      2350
+   2    2200       2.0      2.17     +0.17       202       169      1829
+   3    1788       3.0      2.98     -0.02       141       207      1440
+   4    1413       4.0      3.86     -0.14       115       192      1106
+   5    1123       5.0      4.70     -0.30        73       166       884
+   6     916       6.0      5.45     -0.55        60       165       691
+   7    3289       7.0      6.29     -0.71         0       585      2704
+--------------------------------------------------------------------------------
+ ALL   16453      3.18      3.11    -0.068
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 4: Concrete Examples                │
+└─────────────────────────────────────────────────┘
+
+  === WORST DEGRADATION (Q59, val68K) ===
+  Valid positions: 8
+  Baseline mean τ: 2.250
+  Trained mean τ:  1.125
+  Delta:           -1.125
+    τ=0: baseline    2 ██████████
+         trained     3 ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+    τ=1: baseline    2 ██████████
+         trained     2 ▒▒▒▒▒▒▒▒▒▒
+    τ=2: baseline    1 █████
+         trained     2 ▒▒▒▒▒▒▒▒▒▒
+    τ=3: baseline    1 █████
+         trained     1 ▒▒▒▒▒
+    τ=4: baseline    1 █████
+         trained     0 ▒
+    τ=5: baseline    0 █
+         trained     0 ▒
+    τ=6: baseline    0 █
+         trained     0 ▒
+    τ=7: baseline    1 █████
+         trained     0 ▒
+
+    Position 150 (DEGRADED):
+      baseline τ=7, trained τ=2
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0            't            't            't      ✓      ✓     -3.41     -3.92
+         1        assist        assist        assist      ✓      ✓     -0.28     -0.22
+         2          with           you          with      ✓      ✗     -0.21     +0.16
+         3          that          that          that      ✓      ✓     -0.30     -1.69
+         4       request             .       request      ✓      ✗     -0.80     +0.63
+         5             .             .             .      ✓      ✓     -0.58     -1.78
+         6    <|eot_id|>    <|eot_id|>    <|eot_id|>      ✓      ✓     -1.15     -2.22
+
+    Position 151 (DEGRADED):
+      baseline τ=1, trained τ=0
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0        assist       execute        assist      ✓      ✗     -0.12     +0.05
+         1           you           you          with      ✗      ✗     +0.17     +0.50
+         2          that          that          that      ✓      ✓     -1.86     -2.78
+         3       request             .       request      ✓      ✗     -1.09     +0.43
+         4             .             .             .      ✓      ✓     -0.91     -2.14
+         5    <|eot_id|>    <|eot_id|>    <|eot_id|>      ✓      ✓     -1.82     -2.73
+         6    <|eot_id|>    <|eot_id|>    <|start_he      ✗      ✗       OOV       OOV
+
+  === BEST IMPROVEMENT (Q6, val68K) ===
+  Valid positions: 26
+  Baseline mean τ: 5.269
+  Trained mean τ:  5.615
+  Delta:           +0.346
+    τ=0: baseline    3 ████
+         trained     2 ▒▒▒
+    τ=1: baseline    1 █
+         trained     1 ▒
+    τ=2: baseline    1 █
+         trained     1 ▒
+    τ=3: baseline    1 █
+         trained     1 ▒
+    τ=4: baseline    1 █
+         trained     1 ▒
+    τ=5: baseline    2 ███
+         trained     1 ▒
+    τ=6: baseline    2 ███
+         trained     2 ▒▒▒
+    τ=7: baseline   15 ███████████████████████
+         trained    17 ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+
+    Position 189 (FIXED):
+      baseline τ=2, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0           the           the           the      ✓      ✓     -2.82     -2.83
+         1      equation      equation      equation      ✓      ✓     -4.37     -4.79
+         2             :                                  ✗      ✓     +0.01     -1.84
+         3             2             2             2      ✓      ✓     -2.42     -2.68
+         4             x             x             x      ✓      ✓     -3.09     -3.64
+         5             +             +             +      ✓      ✓     -3.46     -2.96
+         6                                                ✓      ✓     -6.39     -6.53
+
+    Position 195 (FIXED):
+      baseline τ=5, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0                                                ✓      ✓    -10.30    -10.20
+         1             5             5             5      ✓      ✓     -3.60     -2.93
+         2             =             =             =      ✓      ✓     -8.81     -8.52
+         3                                                ✓      ✓     -8.47     -8.38
+         4            11            11            11      ✓      ✓     -5.97     -5.16
+         5             ?             ?             ?      ✗      ✓     +0.23     -0.43
+         6    <|eot_id|>    <|eot_id|>    <|eot_id|>      ✓      ✓     -2.57     -2.72
+
+  === MEDIAN (Q68, val68K) ===
+  Valid positions: 132
+  Baseline mean τ: 3.038
+  Trained mean τ:  2.985
+  Delta:           -0.053
+    τ=0: baseline   25 ███████
+         trained    21 ▒▒▒▒▒▒
+    τ=1: baseline   24 ███████
+         trained    23 ▒▒▒▒▒▒
+    τ=2: baseline   17 █████
+         trained    23 ▒▒▒▒▒▒
+    τ=3: baseline   17 █████
+         trained    18 ▒▒▒▒▒
+    τ=4: baseline   11 ███
+         trained    12 ▒▒▒
+    τ=5: baseline    6 █
+         trained     7 ▒▒
+    τ=6: baseline    6 █
+         trained     8 ▒▒
+    τ=7: baseline   26 ███████
+         trained    20 ▒▒▒▒▒▒
+
+    Position 181 (DEGRADED):
+      baseline τ=7, trained τ=6
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0            of            of            of      ✓      ✓     -8.28     -9.49
+         1         shoes         shoes         shoes      ✓      ✓    -10.87    -10.20
+         2             ,             ,             ,      ✓      ✓     -4.39     -5.03
+         3            we            we            we      ✓      ✓     -4.12     -4.76
+         4          need          need          need      ✓      ✓     -2.58     -4.05
+         5            to            to            to      ✓      ✓     -6.30     -6.11
+         6     calculate          find     calculate      ✓      ✗     -0.50     +0.14
+
+    Position 182 (DEGRADED):
+      baseline τ=7, trained τ=5
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0         shoes         shoes         shoes      ✓      ✓     -7.94     -7.67
+         1             ,             ,             ,      ✓      ✓     -5.38     -5.92
+         2            we            we            we      ✓      ✓     -3.95     -4.61
+         3          need          need          need      ✓      ✓     -3.29     -3.94
+         4            to            to            to      ✓      ✓     -6.34     -6.18
+         5     calculate          find     calculate      ✓      ✗     -0.54     +0.01
+         6           the           the           the      ✓      ✓     -1.57     -1.66
+
+    Position 187 (FIXED):
+      baseline τ=0, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0         first     calculate     calculate      ✗      ✓     +0.70     -0.09
+         1           the           the           the      ✓      ✓     -1.29     -1.12
+         2         total         total         total      ✓      ✓     -0.82     -0.17
+         3        number        number        number      ✓      ✓     -6.63     -6.46
+         4            of            of            of      ✓      ✓    -10.78    -11.77
+         5         pairs         pairs         pairs      ✓      ✓     -0.56     -2.91
+         6            he            of            of      ✗      ✓     +1.31     -0.18
+
+    Position 188 (FIXED):
+      baseline τ=4, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0           the           the           the      ✓      ✓     -0.29     -0.08
+         1         total         total         total      ✓      ✓     -2.94     -2.33
+         2        number        number        number      ✓      ✓     -4.44     -4.29
+         3            of            of            of      ✓      ✓    -10.42    -11.53
+         4         shoes         pairs         pairs      ✗      ✓     +0.08     -2.31
+         5            he            of            of      ✗      ✓     +1.47     -0.09
+         6         shoes         shoes         shoes      ✓      ✓     -8.18     -6.35
+
+======================================================================
+DIAGNOSTIC COMPLETE
+======================================================================

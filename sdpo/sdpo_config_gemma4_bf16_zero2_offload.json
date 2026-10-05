@@ -1,0 +1,43 @@
+{
+  "_comment": "ZeRO-2 BF16 + CPU optimizer offload for Gemma 4 31B target + E2B draft on 2x 80GB H200. ZeRO-2 replicates params (no partition), avoids ZeRO-3's wrong gather on tied frozen embed (mean_tau=0 root cause). Per-rank est: target 62G (untied 64.8G) + draft 9G + grads 4.6G + optim CPU 0G + acts 5G ≈ 82G — tight, gradient checkpointing required (set via deepspeed activation_checkpointing or HF model.gradient_checkpointing_enable).",
+  "bf16": {
+    "enabled": true
+  },
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": 0,
+      "weight_decay": 0.01,
+      "adam_w_mode": true,
+      "betas": [0.9, 0.95]
+    }
+  },
+  "scheduler": {
+    "type": "WarmupDecayLR",
+    "params": {
+      "warmup_min_lr": 0,
+      "warmup_max_lr": 1e-06,
+      "warmup_num_steps": 30,
+      "total_num_steps": 303
+    }
+  },
+  "zero_optimization": {
+    "stage": 2,
+    "allgather_partitions": true,
+    "allgather_bucket_size": 200000000.0,
+    "overlap_comm": true,
+    "reduce_scatter": true,
+    "reduce_bucket_size": 200000000.0,
+    "contiguous_gradients": true
+  },
+  "activation_checkpointing": {
+    "partition_activations": false,
+    "contiguous_memory_optimization": false,
+    "cpu_checkpointing": false
+  },
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 32,
+  "gradient_clipping": 1.0,
+  "steps_per_print": 50,
+  "wall_clock_breakdown": false
+}

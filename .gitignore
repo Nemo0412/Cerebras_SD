@@ -1,0 +1,41 @@
+### Example user template template
+### Example user template
+
+# IntelliJ project files
+.idea
+*.iml
+out
+gen
+
+.DS_Store
+__pycache__/
+
+.claude
+CLAUDE.md
+cache.pt
+logs/
+wandb/
+*.wandb
+*_eval_results/
+
+# Datasets and training outputs (do not commit to repo)
+sdpo/data/*.jsonl
+sdpo/data/aime/
+data/aime/
+acclength_test/
+attn_mlp_nc_speedup.png
+
+# Diagnostic dumps (per-task JSON outputs, not source)
+diagnose_*.json
+diagnose_*.log
+*.log
+acclength_test*.csv
+
+# Top-N benchmark cuts (regenerated on demand)
+data/aime_full/
+# Eval CSV/MD summaries (auto-generated, regenerable from JSON)
+*.csv
+*.md.bak
+smalllm_tree_eval_results_ext/
+data/sharegpt_qwen3_8b_regen.jsonl
+data/sharegpt_qwen3_32b_regen.jsonl

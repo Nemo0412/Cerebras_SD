@@ -1,0 +1,288 @@
+
+======================================================================
+ANALYSIS
+======================================================================
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 1: Four-Quadrant Matrix (per step)  │
+└─────────────────────────────────────────────────┘
+step     A(keep)  B(degrade)      C(fix)  D(still_wrong)  net(C-B)
+----------------------------------------------------------------------
+   0       17313         229         156            2095       -73
+   1       16890         206         208            2489        +2
+   2       16612         239         244            2698        +5
+   3       16377         236         236            2944        +0
+   4       16197         265         243            3088       -22
+   5       15990         236         264            3303       +28
+   6       15782         239         238            3534        -1
+----------------------------------------------------------------------
+ ALL      115161        1650        1589           20151       -61
+
+  A(keep):       83.1%
+  B(degrade):    1.2%
+  C(fix):        1.1%
+  D(still_wrong):14.5%
+  Net effect:    C-B = -61 positions
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 2: Logit Gap at First Rejection     │
+└─────────────────────────────────────────────────┘
+  Paired positions: 28020
+
+  Baseline gap:  mean=3.739, median=2.070
+  Trained gap:   mean=3.807, median=2.228
+  Gap delta:     mean=0.068, median=0.046
+  Positions where gap shrank:   13153/28020 (46.9%)
+  Positions where gap grew:     14867/28020 (53.1%)
+  Positions where argmax flipped (gap<0 after): 2224/28020 (7.9%)
+
+  Baseline target rank: mean=1023.9, median=4
+  Trained target rank:  mean=859.0, median=4
+
+  Baseline gap distribution:
+      gap<0 (already correct): 0 (0.0%)
+      0<gap<1 (close): 7941 (28.3%)
+      1<gap<3 (medium): 8898 (31.8%)
+      3<gap<5 (hard): 4269 (15.2%)
+      gap>5 (very hard): 6912 (24.7%)
+
+  Among 'close' positions (baseline gap<1): 2126/7941 flipped to correct
+
+  Target token logit change:
+    mean delta: -0.0663
+    positions where target logit increased: 14037/28020 (50.1%)
+    positions where target logit decreased: 13983/28020 (49.9%)
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 3: τ Change by Baseline τ Bucket    │
+└─────────────────────────────────────────────────┘
+bl_τ   count   bl_mean   tr_mean     delta  improved  degraded      same
+--------------------------------------------------------------------------------
+   0    2251       0.0      0.28     +0.28       156         0      2095
+   1    2197       1.0      1.30     +0.30       182        44      1971
+   2    1932       2.0      2.23     +0.23       178        84      1670
+   3    1670       3.0      3.13     +0.13       134        87      1449
+   4    1384       4.0      4.04     +0.04       111        85      1188
+   5    1220       5.0      4.96     -0.04       101        88      1031
+   6    1103       6.0      5.81     -0.19        77        85       941
+   7    8036       7.0      6.77     -0.23         0       473      7563
+--------------------------------------------------------------------------------
+ ALL   19793      4.32      4.32    -0.005
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 4: Concrete Examples                │
+└─────────────────────────────────────────────────┘
+
+  === WORST DEGRADATION (Q70, humaneval) ===
+  Valid positions: 255
+  Baseline mean τ: 5.263
+  Trained mean τ:  4.996
+  Delta:           -0.267
+    τ=0: baseline   19 ██
+         trained    19 ▒▒
+    τ=1: baseline   20 ███
+         trained    23 ▒▒▒
+    τ=2: baseline   14 ██
+         trained    17 ▒▒
+    τ=3: baseline   14 ██
+         trained    18 ▒▒
+    τ=4: baseline    9 █
+         trained    14 ▒▒
+    τ=5: baseline   12 █
+         trained    14 ▒▒
+    τ=6: baseline   13 ██
+         trained    13 ▒▒
+    τ=7: baseline  154 ████████████████████████
+         trained   137 ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+
+    Position 292 (DEGRADED):
+      baseline τ=7, trained τ=1
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0           def           def           def      ✓      ✓     -1.87     -2.12
+         1            is         words            is      ✓      ✗     -0.02     +0.49
+         2        _prime        _prime        _prime      ✓      ✓     -3.75     -5.30
+         3            (n            (n            (n      ✓      ✓     -2.10     -2.24
+         4            ):            ):            ):      ✓      ✓     -1.85     -2.57
+         5                                                ✓      ✓    -10.33    -10.29
+         6           """           """           """      ✓      ✓     -2.71     -3.80
+
+    Position 310 (DEGRADED):
+      baseline τ=7, trained τ=5
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0                                                ✓      ✓     -0.69     -1.18
+         1           """           """           """      ✓      ✓     -0.65     -0.73
+         2                                                ✓      ✓     -6.01     -6.34
+         3            if            if            if      ✓      ✓     -4.99     -5.56
+         4             n             n             n      ✓      ✓     -4.69     -4.31
+         5            <=             <            <=      ✓      ✗     -0.15     +0.72
+         6                                                ✓      ✓     -7.76     -7.86
+
+    Position 423 (FIXED):
+      baseline τ=1, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0      sentence      sentence      sentence      ✓      ✓     -9.54    -10.31
+         1         whose             ,             ,      ✗      ✓     +0.26     -1.29
+         2                                                ✓      ✓     -4.89     -5.88
+         3         whose         whose         whose      ✓      ✓     -4.62     -4.08
+         4       lengths       lengths       lengths      ✓      ✓     -7.42     -6.45
+         5           are           are           are      ✓      ✓     -7.63     -7.87
+         6         prime         prime         prime      ✓      ✓     -5.79     -5.50
+
+    Position 452 (FIXED):
+      baseline τ=5, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0            in            in            in      ✓      ✓     -7.00     -7.30
+         1         words         words         words      ✓      ✓     -5.57     -5.99
+         2             :             :             :      ✓      ✓     -9.90    -10.46
+         3                                                ✓      ✓    -10.74     -9.88
+         4            if            if            if      ✓      ✓     -3.33     -3.73
+         5           len            is            is      ✗      ✓     +0.05     -0.05
+         6        _prime        _prime        _prime      ✓      ✓     -5.22     -5.87
+
+  === BEST IMPROVEMENT (Q6, humaneval) ===
+  Valid positions: 255
+  Baseline mean τ: 3.663
+  Trained mean τ:  3.961
+  Delta:           +0.298
+    τ=0: baseline   33 █████
+         trained    31 ▒▒▒▒
+    τ=1: baseline   41 ██████
+         trained    34 ▒▒▒▒▒
+    τ=2: baseline   36 █████
+         trained    30 ▒▒▒▒
+    τ=3: baseline   23 ███
+         trained    22 ▒▒▒
+    τ=4: baseline   20 ███
+         trained    23 ▒▒▒
+    τ=5: baseline   14 ██
+         trained    16 ▒▒
+    τ=6: baseline   14 ██
+         trained    15 ▒▒
+    τ=7: baseline   74 ███████████
+         trained    84 ▒▒▒▒▒▒▒▒▒▒▒▒▒
+
+    Position 248 (DEGRADED):
+      baseline τ=3, trained τ=0
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0       divisor        number       divisor      ✓      ✗     -0.93     +0.89
+         1            of            of            of      ✓      ✓     -3.27     -4.22
+         2             n             n             n      ✓      ✓     -2.49     -2.77
+         3             .             .       smaller      ✗      ✗     +9.48     +9.73
+         4          than          than          than      ✓      ✓     -7.76     -7.80
+         5             n             n             n      ✓      ✓     -4.00     -4.47
+         6             .             .             .      ✓      ✓     -0.92     -0.96
+
+    Position 276 (DEGRADED):
+      baseline τ=2, trained τ=1
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0         range         range         range      ✓      ✓     -7.07     -7.39
+         1            (n             (            (n      ✓      ✗     -0.33     +0.08
+         2            //            //             -      ✗      ✗     +0.10     +0.19
+         3                                                ✓      ✓     -7.33     -7.72
+         4             1             1             1      ✓      ✓     -0.37     -0.05
+         5             ,             ,             ,      ✓      ✓     -4.56     -3.09
+         6                                                ✓      ✓     -1.04     -0.94
+
+    Position 204 (FIXED):
+      baseline τ=3, trained τ=5
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0           int           int           int      ✓      ✓     -7.10     -8.28
+         1             :             :             :      ✓      ✓     -9.24     -9.53
+         2                                                ✓      ✓    -10.92    -11.03
+         3           """           """           """      ✗      ✓     +0.08     -0.86
+         4                                                ✓      ✓     -9.22     -9.71
+         5          This          This           For      ✗      ✗     +4.59     +4.09
+         6             a             a             a      ✓      ✓     -6.48     -6.77
+
+    Position 206 (FIXED):
+      baseline τ=1, trained τ=3
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0                                                ✓      ✓     -8.39     -8.51
+         1           """           """           """      ✗      ✓     +0.19     -0.64
+         2                                                ✓      ✓     -8.82     -8.61
+         3          This          This           For      ✗      ✗     +3.66     +3.07
+         4             a             a             a      ✓      ✓     -6.97     -7.36
+         5         given         given         given      ✓      ✓     -7.06     -7.01
+         6        number        number        number      ✓      ✓     -5.22     -6.08
+
+  === MEDIAN (Q12, humaneval) ===
+  Valid positions: 255
+  Baseline mean τ: 5.800
+  Trained mean τ:  5.792
+  Delta:           -0.008
+    τ=0: baseline   12 █
+         trained    11 ▒
+    τ=1: baseline   10 █
+         trained    12 ▒
+    τ=2: baseline   10 █
+         trained     9 ▒
+    τ=3: baseline   11 █
+         trained    12 ▒
+    τ=4: baseline   10 █
+         trained    10 ▒
+    τ=5: baseline   13 ██
+         trained    12 ▒
+    τ=6: baseline   12 █
+         trained    12 ▒
+    τ=7: baseline  177 ███████████████████████████
+         trained   177 ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+
+    Position 453 (DEGRADED):
+      baseline τ=7, trained τ=4
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0                                                ✓      ✓     -6.79     -8.06
+         1                                                ✓      ✓     -8.87     -9.96
+         2        return        return        return      ✓      ✓     -6.15     -6.54
+         3          True          True          True      ✓      ✓     -3.64     -3.04
+         4                                                ✓      ✗     -0.67     +6.12
+         5           def           def           def      ✓      ✓     -8.82     -8.21
+         6    intersecti    intersecti    intersecti      ✓      ✓     -0.86     -0.33
+
+    Position 455 (DEGRADED):
+      baseline τ=5, trained τ=2
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0        return        return        return      ✓      ✓     -9.64     -9.69
+         1          True          True          True      ✓      ✓     -8.16     -7.57
+         2                                                ✓      ✗     -1.06     +6.19
+         3           def           def           def      ✓      ✓     -8.70     -7.99
+         4    intersecti            is    intersecti      ✓      ✗     -0.17     +0.24
+         5          (int          (int     (interval      ✗      ✗       OOV       OOV
+         6             1             1             1      ✓      ✓     -9.98     -9.81
+
+    Position 391 (FIXED):
+      baseline τ=2, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0     completed     completed     completed      ✓      ✓     -0.58     -1.14
+         1          code          code          code      ✓      ✓     -2.05     -2.52
+         2            in             :             :      ✗      ✓     +0.05     -0.00
+         3           ```           ```           ```      ✓      ✓     -8.10     -8.56
+         4        python        python        python      ✓      ✓    -10.68     -8.97
+         5                                                ✓      ✓    -11.05    -11.58
+         6           def           def           def      ✓      ✓     -3.60     -3.72
+
+    Position 428 (FIXED):
+      baseline τ=4, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0             2             2             2      ✓      ✓    -10.34    -10.38
+         1             ,             ,             ,      ✓      ✓     -9.45    -10.59
+         2           int           int           int      ✓      ✓     -4.37     -3.51
+         3            (n            (n            (n      ✓      ✓     -7.62     -7.28
+         4            **            **            **      ✗      ✓     +0.19     -0.48
+         5             0             0             0      ✓      ✓     -6.99     -6.52
+         6             .             .             .      ✓      ✓     -2.10     -1.52
+
+======================================================================
+DIAGNOSTIC COMPLETE
+======================================================================

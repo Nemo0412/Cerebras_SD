@@ -1,0 +1,30 @@
+{
+  "tag": "perf_g6_b64",
+  "results": {
+    "gsm8k": {
+      "baseline_chain": {
+        "mean_alpha": 3.9724358974358975,
+        "tokens_per_sec": 21.664230733483528,
+        "total_time": 358.0556399822235
+      },
+      "tree": {
+        "mean_alpha": 4.779346210995542,
+        "tokens_per_sec": 26.453165385769214,
+        "total_time": 294.06688714027405,
+        "draft_time": 251.2061309814453,
+        "target_time": 42.860756158828735,
+        "draft_fraction": 0.8542482746845838,
+        "gamma": 6,
+        "top_k": [
+          4,
+          2,
+          2,
+          1,
+          1,
+          1
+        ],
+        "budget": 64
+      }
+    }
+  }
+}

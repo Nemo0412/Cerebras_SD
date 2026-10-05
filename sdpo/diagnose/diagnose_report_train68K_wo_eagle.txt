@@ -1,0 +1,288 @@
+
+======================================================================
+ANALYSIS
+======================================================================
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 1: Four-Quadrant Matrix (per step)  │
+└─────────────────────────────────────────────────┘
+step     A(keep)  B(degrade)      C(fix)  D(still_wrong)  net(C-B)
+----------------------------------------------------------------------
+   0       12882         385         313            2808       -72
+   1       12360         405         299            3324      -106
+   2       12081         393         325            3589       -68
+   3       11848         389         303            3848       -86
+   4       11586         360         337            4105       -23
+   5       11388         360         322            4318       -38
+   6       11120         364         347            4557       -17
+----------------------------------------------------------------------
+ ALL       83265        2656        2246           26549      -410
+
+  A(keep):       72.6%
+  B(degrade):    2.3%
+  C(fix):        2.0%
+  D(still_wrong):23.1%
+  Net effect:    C-B = -410 positions
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 2: Logit Gap at First Rejection     │
+└─────────────────────────────────────────────────┘
+  Paired positions: 28643
+
+  Baseline gap:  mean=3.391, median=1.903
+  Trained gap:   mean=3.441, median=2.089
+  Gap delta:     mean=0.050, median=0.037
+  Positions where gap shrank:   13774/28643 (48.1%)
+  Positions where gap grew:     14869/28643 (51.9%)
+  Positions where argmax flipped (gap<0 after): 2381/28643 (8.3%)
+
+  Baseline target rank: mean=1024.5, median=4
+  Trained target rank:  mean=871.3, median=4
+
+  Baseline gap distribution:
+      gap<0 (already correct): 0 (0.0%)
+      0<gap<1 (close): 8687 (30.3%)
+      1<gap<3 (medium): 9351 (32.6%)
+      3<gap<5 (hard): 4200 (14.7%)
+      gap>5 (very hard): 6405 (22.4%)
+
+  Among 'close' positions (baseline gap<1): 2254/8687 flipped to correct
+
+  Target token logit change:
+    mean delta: -0.1143
+    positions where target logit increased: 13176/28643 (46.0%)
+    positions where target logit decreased: 15467/28643 (54.0%)
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 3: τ Change by Baseline τ Bucket    │
+└─────────────────────────────────────────────────┘
+bl_τ   count   bl_mean   tr_mean     delta  improved  degraded      same
+--------------------------------------------------------------------------------
+   0    3121       0.0      0.33     +0.33       313         0      2808
+   1    2693       1.0      1.25     +0.25       237        93      2363
+   2    2155       2.0      2.14     +0.14       186       155      1814
+   3    1666       3.0      3.04     +0.04       135       156      1375
+   4    1394       4.0      3.92     -0.08       130       172      1092
+   5    1066       5.0      4.69     -0.31        74       144       848
+   6     824       6.0      5.50     -0.50        61       136       627
+   7    3469       7.0      6.38     -0.62         0       542      2927
+--------------------------------------------------------------------------------
+ ALL   16388      3.18      3.12    -0.058
+
+┌─────────────────────────────────────────────────┐
+│  DIAGNOSTIC 4: Concrete Examples                │
+└─────────────────────────────────────────────────┘
+
+  === WORST DEGRADATION (Q17, train68K) ===
+  Valid positions: 255
+  Baseline mean τ: 5.435
+  Trained mean τ:  4.639
+  Delta:           -0.796
+    τ=0: baseline   19 ██
+         trained    27 ▒▒▒▒
+    τ=1: baseline   15 ██
+         trained    22 ▒▒▒
+    τ=2: baseline   15 ██
+         trained    24 ▒▒▒
+    τ=3: baseline   11 █
+         trained    20 ▒▒▒
+    τ=4: baseline   11 █
+         trained    13 ▒▒
+    τ=5: baseline    7 █
+         trained    15 ▒▒
+    τ=6: baseline   10 █
+         trained    12 ▒
+    τ=7: baseline  167 ██████████████████████████
+         trained   122 ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+
+    Position 154 (DEGRADED):
+      baseline τ=7, trained τ=0
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0          come          with          come      ✓      ✗     -0.82     +0.08
+         1            up            up            up      ✓      ✓     -9.46     -8.22
+         2          with          with          with      ✓      ✓    -14.18    -15.07
+         3          some          some          some      ✓      ✓     -4.31     -4.71
+         4      creative      creative      creative      ✓      ✓     -4.04     -4.63
+         5         ideas         ideas         ideas      ✓      ✓     -2.96     -3.74
+         6           for           for           for      ✓      ✓     -3.53     -4.67
+
+    Position 159 (DEGRADED):
+      baseline τ=7, trained τ=6
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0         ideas         ideas         ideas      ✓      ✓     -2.06     -2.76
+         1           for           for           for      ✓      ✓     -5.13     -6.28
+         2             a             a             a      ✓      ✓     -3.16     -3.36
+         3                                                ✓      ✓     -3.80     -5.17
+         4            10            10            10      ✓      ✓    -10.36    -10.81
+         5         -year         -year         -year      ✓      ✓     -6.55     -4.28
+         6          -old           old          -old      ✓      ✗     -7.82     +1.87
+
+    Position 185 (FIXED):
+      baseline τ=6, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0             a             a             a      ✓      ✓     -4.50     -4.43
+         1          tent          tent          tent      ✓      ✓     -5.00     -3.04
+         2            in            in            in      ✓      ✓     -2.67     -2.96
+         3           the           the           the      ✓      ✓     -1.72     -1.98
+         4      backyard      backyard      backyard      ✓      ✓     -5.96     -6.72
+         5             ,             ,             ,      ✓      ✓     -1.37     -0.80
+         6          have           and           and      ✗      ✓     +0.01     -0.12
+
+    Position 211 (FIXED):
+      baseline τ=5, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0            'm            'm            'm      ✓      ✓     -9.07     -9.96
+         1          ores          ores          ores      ✓      ✓    -11.59    -10.68
+         2             ,             ,             ,      ✓      ✓     -4.40     -5.23
+         3           and           and           and      ✓      ✓     -7.22     -7.51
+         4         enjoy         enjoy         enjoy      ✓      ✓     -1.96     -1.11
+         5            st          some          some      ✗      ✓     +0.15     -0.45
+         6       quality       quality       quality      ✓      ✓     -0.97     -2.41
+
+  === BEST IMPROVEMENT (Q77, train68K) ===
+  Valid positions: 38
+  Baseline mean τ: 2.868
+  Trained mean τ:  3.447
+  Delta:           +0.579
+    τ=0: baseline    9 █████████
+         trained     9 ▒▒▒▒▒▒▒▒▒
+    τ=1: baseline    8 ████████
+         trained     5 ▒▒▒▒▒
+    τ=2: baseline    4 ████
+         trained     4 ▒▒▒▒
+    τ=3: baseline    3 ███
+         trained     3 ▒▒▒
+    τ=4: baseline    2 ██
+         trained     1 ▒
+    τ=5: baseline    3 ███
+         trained     2 ▒▒
+    τ=6: baseline    2 ██
+         trained     3 ▒▒▒
+    τ=7: baseline    7 ███████
+         trained    11 ▒▒▒▒▒▒▒▒▒▒▒
+
+    Position 173 (DEGRADED):
+      baseline τ=7, trained τ=6
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0           the           the           the      ✓      ✓     -5.63     -5.59
+         1        dining        dining        dining      ✓      ✓     -4.68     -6.11
+         2          room          room          room      ✓      ✓     -5.63     -6.07
+         3             ,             ,             ,      ✓      ✓     -4.63     -5.33
+         4           the           the           the      ✓      ✓     -0.86     -1.24
+         5         apple         apple         apple      ✓      ✓     -5.28     -5.04
+         6            is         would            is      ✓      ✗     -0.52     +0.18
+
+    Position 188 (DEGRADED):
+      baseline τ=1, trained τ=0
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0          with          from          with      ✓      ✗     -0.34     +0.18
+         1           you           the           the      ✗      ✓     +0.01     -0.31
+         2         plate         plate         plate      ✓      ✓     -0.92     -0.20
+         3          from          from          from      ✓      ✓     -0.33     -0.60
+         4           the           the           the      ✓      ✓     -1.90     -2.66
+         5       kitchen       kitchen       kitchen      ✓      ✓     -2.94     -3.58
+         6            to            to            to      ✓      ✓     -5.19     -6.03
+
+    Position 167 (FIXED):
+      baseline τ=2, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0           the           the           the      ✓      ✓     -3.92     -4.10
+         1         apple         apple         apple      ✓      ✓     -2.66     -3.45
+         2             ,          from          from      ✗      ✓     +0.23     -0.19
+         3           the           the           the      ✓      ✓     -2.09     -2.58
+         4       kitchen       kitchen       kitchen      ✓      ✓     -3.95     -4.61
+         5            to            to            to      ✓      ✓     -1.84     -1.97
+         6           the           the           the      ✓      ✓     -4.88     -5.22
+
+    Position 174 (FIXED):
+      baseline τ=6, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0        dining        dining        dining      ✓      ✓     -6.88     -6.49
+         1          room          room          room      ✓      ✓     -7.71     -8.30
+         2             ,             ,             ,      ✓      ✓     -6.29     -6.99
+         3           the           the           the      ✓      ✓     -0.70     -1.02
+         4         apple         apple         apple      ✓      ✓     -5.88     -5.55
+         5            is            is            is      ✓      ✓     -1.30     -0.63
+         6        likely         still         still      ✗      ✓     +1.02     -0.02
+
+  === MEDIAN (Q64, train68K) ===
+  Valid positions: 255
+  Baseline mean τ: 2.957
+  Trained mean τ:  2.914
+  Delta:           -0.043
+    τ=0: baseline   60 █████████
+         trained    60 ▒▒▒▒▒▒▒▒▒
+    τ=1: baseline   41 ██████
+         trained    41 ▒▒▒▒▒▒
+    τ=2: baseline   34 █████
+         trained    34 ▒▒▒▒▒
+    τ=3: baseline   26 ████
+         trained    27 ▒▒▒▒
+    τ=4: baseline   17 ██
+         trained    21 ▒▒▒
+    τ=5: baseline   14 ██
+         trained    12 ▒
+    τ=6: baseline   12 █
+         trained    11 ▒
+    τ=7: baseline   51 ████████
+         trained    49 ▒▒▒▒▒▒▒
+
+    Position 148 (DEGRADED):
+      baseline τ=5, trained τ=0
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0    engineerin     technical    engineerin      ✓      ✗     -0.04     +0.73
+         1    applicatio    applicatio    applicatio      ✓      ✓     -5.12     -5.10
+         2             .             .             .      ✓      ✓     -3.58     -4.01
+         3            It            It            It      ✓      ✓     -5.33     -4.75
+         4      provides            's      provides      ✓      ✗     -0.10     +0.08
+         5             a             a     functions      ✗      ✗     +1.58     +1.10
+         6           for           for           for      ✓      ✓     -1.31     -0.87
+
+    Position 157 (DEGRADED):
+      baseline τ=4, trained τ=0
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0    engineerin     technical    engineerin      ✓      ✗     -0.17     +0.30
+         1    applicatio    applicatio    applicatio      ✓      ✓     -1.71     -1.50
+         2             ,             ,             ,      ✓      ✓     -2.03     -2.61
+         3     including     including     including      ✓      ✓     -0.05     -0.37
+         4     numerical        signal        signal      ✗      ✓     +0.58     -0.27
+         5    processing    processing    processing      ✓      ✓     -6.83     -7.17
+         6             ,             ,             ,      ✓      ✓     -5.01     -5.04
+
+    Position 156 (FIXED):
+      baseline τ=5, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0           and           and           and      ✓      ✓     -2.31     -3.14
+         1    engineerin    engineerin    engineerin      ✓      ✓     -2.95     -2.38
+         2    applicatio    applicatio    applicatio      ✓      ✓     -0.28     -0.17
+         3             ,             ,             ,      ✓      ✓     -2.34     -2.52
+         4     including     including     including      ✓      ✓     -0.61     -1.06
+         5     numerical        signal        signal      ✗      ✓     +0.38     -0.60
+         6    processing    processing    processing      ✓      ✓     -6.45     -6.75
+
+    Position 228 (FIXED):
+      baseline τ=0, trained τ=7
+      step     bl_argmax     tr_argmax        target  bl_ok  tr_ok    bl_gap    tr_gap
+      --------------------------------------------------------------------------------
+         0    operations    multiplica    multiplica      ✗      ✓     +0.05     -0.34
+         1             ,             ,             ,      ✓      ✓     -2.55     -2.57
+         2         eigen         eigen         eigen      ✓      ✓     -0.17     -2.42
+         3         value         value         value      ✓      ✓     -1.36     -0.84
+         4    decomposit    decomposit    decomposit      ✓      ✓     -4.45     -3.14
+         5             ,             ,             ,      ✓      ✓     -8.91     -8.90
+         6           and           and           and      ✓      ✓     -5.64     -6.56
+
+======================================================================
+DIAGNOSTIC COMPLETE
+======================================================================

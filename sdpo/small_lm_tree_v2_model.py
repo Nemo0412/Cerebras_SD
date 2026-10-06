@@ -201,7 +201,16 @@ def induce_path_topk_union(full_parents, paths, path_scores, path_topk):
     return parents_out, gather_index, sel
 
 
-def soft_topk_tree_eal(alpha, parents, paths, path_scores, path_topk, tau=1.0):
+def _expected_acceptance(draft_logits, target_logits, temperature):
+    """P(target accepts a token drawn from the draft) at each node."""
+    T = max(float(temperature), 1e-6)
+    q = torch.softmax(draft_logits / T, dim=-1)
+    p = torch.softmax(target_logits / T, dim=-1)
+    return (q * p).sum(-1)
+
+
+def soft_topk_tree_eal(alpha, parents, paths, path_scores, path_topk, tau=1.0,
+                       alpha_soft=None):
     """Soft Top-K surrogate of E[L](TopK(T), q).
 
     pi = softmax(s / tau)
@@ -211,6 +220,13 @@ def soft_topk_tree_eal(alpha, parents, paths, path_scores, path_topk, tau=1.0):
     Shared prefixes are one node. Parallel branches use the survival recursion.
     Returns (loss, eal_soft_mean, eal_hard_mean). loss = -E_soft.
     eal_hard is the exact discrete Top-K union and is detached.
+
+    The forward value of alpha stays the hard target probability of the drafted
+    token. Path scores alone only rescale those already-chosen tokens, so the
+    greedy tree and its accept length do not move. alpha_soft is the expected
+    acceptance q·p at the same nodes; it is added with a straight-through
+    estimator so the draft distribution is trained toward tokens the target
+    would accept.
     """
     if path_scores.dim() != 2:
         raise ValueError(f"path_scores must be [B, P], got {tuple(path_scores.shape)}")
@@ -219,7 +235,12 @@ def soft_topk_tree_eal(alpha, parents, paths, path_scores, path_topk, tau=1.0):
     if k < 1:
         raise ValueError(f"path_topk must be >= 1, got {path_topk}")
     device = path_scores.device
-    alpha = alpha.detach()
+    alpha_hard = alpha.detach()
+    if alpha_soft is None:
+        alpha = alpha_hard
+    else:
+        # Forward value is the hard acceptance. Gradient is d(q·p).
+        alpha = alpha_hard + (alpha_soft - alpha_soft.detach())
     if parents.dim() == 1:
         parent_rows = parents.to(device=device, dtype=torch.long).view(1, -1).expand(B, -1)
         parent_list = parents.tolist()
@@ -238,7 +259,7 @@ def soft_topk_tree_eal(alpha, parents, paths, path_scores, path_topk, tau=1.0):
     union_parents, gather_index, _sel = induce_path_topk_union(
         parent_list, paths, path_scores.detach(), k)
     valid = gather_index >= 0
-    picked = alpha.gather(1, gather_index.clamp(min=0))
+    picked = alpha_hard.gather(1, gather_index.clamp(min=0))
     alpha_u = torch.where(valid, picked, torch.zeros_like(picked))
     eal_hard = tree_expected_accepted_length(alpha_u, union_parents)
     loss = -eal_soft.mean()
@@ -420,7 +441,9 @@ class SmallLMTreeV2Model(nn.Module):
         tokens_per_depth = [root_tok]
         scores_per_depth = [root_scores]
         pred_per_depth = []
-        skip_full_logits = eal_mode in ("node_marginal", "soft_topk")
+        # soft_topk keeps the draft distribution at every node. Acceptance is
+        # q·p, so the gradient can move the drafted token, not only its log-prob.
+        skip_full_logits = eal_mode == "node_marginal"
         if not skip_full_logits:
             pred_per_depth.append(
                 drf_root.unsqueeze(1).expand(B, top_k[0], -1).contiguous())
@@ -537,7 +560,7 @@ class SmallLMTreeV2Model(nn.Module):
             tgt_root.unsqueeze(1).expand(B, N, -1),
         )
 
-        if skip_full_logits:
+        if skip_full_logits or eal_mode == "soft_topk":
             kl = drf_root.new_zeros(())
         else:
             tgt_logp = F.log_softmax(tgt_node, dim=-1)
@@ -586,9 +609,20 @@ class SmallLMTreeV2Model(nn.Module):
                 eal_loss, eal = node_marginal_eal_loss(
                     alpha_u, union_parents, logp_u, valid)
             elif eal_mode == "soft_topk":
+                alpha_soft = _expected_acceptance(drf_node, tgt_node, T)
+                if alpha_soft.size(1) != alpha_full.size(1):
+                    if last_sel is None:
+                        raise RuntimeError(
+                            "soft_topk acceptance layout does not match the tree "
+                            f"({alpha_soft.size(1)} vs {alpha_full.size(1)})")
+                    leaf_src = alpha_soft[:, n_prefix:]
+                    leaf_dst = alpha_full[:, n_prefix:].detach().scatter(
+                        1, last_sel, leaf_src)
+                    alpha_soft = torch.cat([alpha_soft[:, :n_prefix], leaf_dst], dim=1)
                 eal_loss, _eal_soft, eal = soft_topk_tree_eal(
                     alpha_full, torch.tensor(self.tree_parents, device=device),
-                    self.paths, full_leaf_sc, path_topk, tau=T)
+                    self.paths, full_leaf_sc, path_topk, tau=T,
+                    alpha_soft=alpha_soft)
             else:
                 eal = tree_expected_accepted_length(alpha_u, union_parents).mean()
                 eal_loss = None

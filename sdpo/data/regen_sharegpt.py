@@ -161,7 +161,7 @@ class ShareGPTProcessor:
                     new_conv.append(turn)
                     key = (item_idx, turn_idx)
                     if key in response_map:
-                        new_conv.append({"from": "assistant", "value": response_map[key]})
+                        new_conv.append({"from": "gpt", "value": response_map[key]})
             out.append({
                 "id": item.get("id", f"conversation_{item_idx}"),
                 "conversations": new_conv,

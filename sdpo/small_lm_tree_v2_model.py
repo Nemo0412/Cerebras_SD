@@ -209,6 +209,31 @@ def _expected_acceptance(draft_logits, target_logits, temperature):
     return (q * p).sum(-1)
 
 
+def acceptance_weighted_kl(draft_logits, target_logits, alpha, parents,
+                           temperature):
+    """KL(target || draft), weighted by how much each node's acceptance changes E[L].
+
+    alpha and parents describe the drafted tree. The weight is stop-grad
+    d TreeEAL / d alpha, so a node that cannot change the accept length does
+    not pull the draft. Minimizing this moves the draft's mode toward the
+    target token instead of only rescaling the token that is already chosen.
+    """
+    if alpha.shape != draft_logits.shape[:2]:
+        raise ValueError(
+            "acceptance weights must align with draft logits, "
+            f"got alpha {tuple(alpha.shape)} logits {tuple(draft_logits.shape)}")
+    T = max(float(temperature), 1e-6)
+    with torch.enable_grad():
+        alpha_live = alpha.detach().requires_grad_(True)
+        eal_vec = tree_expected_accepted_length(alpha_live, parents)
+        weights = torch.autograd.grad(eal_vec.sum(), alpha_live)[0]
+    weights = weights.detach().clamp(min=0)
+    log_p = torch.log_softmax(target_logits / T, dim=-1)
+    log_q = torch.log_softmax(draft_logits / T, dim=-1)
+    kl = (log_p.exp() * (log_p - log_q)).sum(-1)
+    return (weights * kl).sum() / alpha.shape[0]
+
+
 def soft_topk_tree_eal(alpha, parents, paths, path_scores, path_topk, tau=1.0,
                        alpha_soft=None):
     """Soft Top-K surrogate of E[L](TopK(T), q).
@@ -441,8 +466,8 @@ class SmallLMTreeV2Model(nn.Module):
         tokens_per_depth = [root_tok]
         scores_per_depth = [root_scores]
         pred_per_depth = []
-        # soft_topk keeps the draft distribution at every node. Acceptance is
-        # q·p, so the gradient can move the drafted token, not only its log-prob.
+        # soft_topk keeps the draft distribution so the weighted KL can move
+        # probability onto tokens the target would accept.
         skip_full_logits = eal_mode == "node_marginal"
         if not skip_full_logits:
             pred_per_depth.append(
@@ -609,20 +634,16 @@ class SmallLMTreeV2Model(nn.Module):
                 eal_loss, eal = node_marginal_eal_loss(
                     alpha_u, union_parents, logp_u, valid)
             elif eal_mode == "soft_topk":
-                alpha_soft = _expected_acceptance(drf_node, tgt_node, T)
-                if alpha_soft.size(1) != alpha_full.size(1):
-                    if last_sel is None:
-                        raise RuntimeError(
-                            "soft_topk acceptance layout does not match the tree "
-                            f"({alpha_soft.size(1)} vs {alpha_full.size(1)})")
-                    leaf_src = alpha_soft[:, n_prefix:]
-                    leaf_dst = alpha_full[:, n_prefix:].detach().scatter(
-                        1, last_sel, leaf_src)
-                    alpha_soft = torch.cat([alpha_soft[:, :n_prefix], leaf_dst], dim=1)
-                eal_loss, _eal_soft, eal = soft_topk_tree_eal(
-                    alpha_full, torch.tensor(self.tree_parents, device=device),
-                    self.paths, full_leaf_sc, path_topk, tau=T,
-                    alpha_soft=alpha_soft)
+                # -TreeEAL(beta * alpha) only rescales the tokens already in the
+                # greedy tree, and the q·p straight-through at a large step
+                # replaces those tokens with ones the target rejects. Train the
+                # draft toward the target instead, with more weight on nodes
+                # that actually change the accept length.
+                alpha_pruned = torch.softmax(tgt_node / T, dim=-1).gather(
+                    -1, tokens.long().unsqueeze(-1)).squeeze(-1)
+                eal_loss = acceptance_weighted_kl(
+                    drf_node, tgt_node, alpha_pruned, parents, T)
+                eal = tree_expected_accepted_length(alpha_u, union_parents).mean()
             else:
                 eal = tree_expected_accepted_length(alpha_u, union_parents).mean()
                 eal_loss = None

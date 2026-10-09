@@ -60,11 +60,18 @@ parser.add_argument('--temperature', type=float, default=1.0,
                     help='Target softmax temperature for Tree-EAL acceptance '
                          'probabilities. Draft tree stays greedy top-k.')
 parser.add_argument('--eal_mode', type=str, default='budget',
-                    choices=['budget', 'path_topk', 'node_marginal', 'soft_topk'],
+                    choices=['budget', 'path_topk', 'node_marginal', 'soft_topk',
+                             'sample_minpq'],
                     help='budget: KL minus E[L] on the node-budget tree. '
                          'path_topk: KL minus exact E[L] on the Top-K path union. '
                          'node_marginal: old node-weighted NLL, not used. '
-                         'soft_topk: -TreeEAL(beta * alpha) with soft Top-K.')
+                         'soft_topk: loss = -E[L] on the Top-K path union. '
+                         'Forward α = p_target(drafted token). '
+                         'Backward moves the draft toward the target. '
+                         'sample_minpq: draft samples the tree, α = min(p, q), '
+                         'loss = -sum over nodes of prod α along the path. '
+                         'Logged accept length is one realized eval-rule draw. '
+                         'Eval with --draft-mode sample --verify-mode ratio.')
 parser.add_argument('--path_topk', type=int, default=16,
                     help='K for path_topk, node_marginal, and soft_topk.')
 parser.add_argument('--local_rank', type=int, default=-1)
@@ -283,6 +290,7 @@ for epoch in range(start_epoch, args.num_epochs):
                 "epoch": epoch,
                 "loss": metrics["total_loss"],
                 "eal_loss": metrics["eal_loss"],
+                "dense_loss": metrics["dense_loss"],
                 "analytic_accepted_length": metrics["eal_mean"],
                 "kl": metrics["kl_loss"],
                 "grad_norm": gn,
@@ -293,6 +301,7 @@ for epoch in range(start_epoch, args.num_epochs):
             _append_jsonl(step_log_path, row)
             print(f"  step {global_step} epoch {epoch} | "
                   f"loss={row['loss']:.4f}  eal_loss={row['eal_loss']:.4f}  "
+                  f"dense_loss={metrics['dense_loss']:.4f}  "
                   f"analytic_accepted_length={row['analytic_accepted_length']:.4f}  "
                   f"kl={row['kl']:.4f}  grad_norm={row['grad_norm']:.4f}",
                   flush=True)
@@ -301,6 +310,7 @@ for epoch in range(start_epoch, args.num_epochs):
                 "train/kl_loss": metrics["kl_loss"],
                 "train/aux_loss": metrics["aux_loss"],
                 "train/eal_loss": metrics["eal_loss"],
+                "train/dense_loss": metrics["dense_loss"],
                 "train/eal_mean": metrics["eal_mean"],
                 "train/num_anchors": metrics["num_anchors"],
                 "train/grad_norm": gn,

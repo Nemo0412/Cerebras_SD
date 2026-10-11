@@ -91,7 +91,8 @@ parser.add_argument('--anchor', type=str, default='kl',
 parser.add_argument('--aux_loss', type=str, default='v2',
                     choices=['none', 'v2', 'v4', 'v4_w1', 'v4eal', 'v5', 'v6', 'v7', 'v8',
                              'tv', 'eal', 'eal_w1', 'peal',
-                             'al_tv', 'al_kl', 'wkl',
+                             'al_tv', 'al_tree', 'al_cover', 'al_greedy', 'al_greedy_tree',
+                             'al_kl', 'wkl',
                              'al_tv_intersect_topk', 'al_tv_target_topk',
                              'al_tv_target_topp',
                              'al_tv_target_topk_topp',
@@ -133,6 +134,17 @@ parser.add_argument('--wk_bonus', type=float, default=1.0,
                          'wk_bonus=0 → identical to full ALTV; '
                          'wk_bonus=∞ (in limit) → identical to tree_altv (top-K restricted). '
                          'Only used by tree_altv_wk.')
+parser.add_argument('--altree_topk', type=str, default='4,3,2,1,1,1,1',
+                    help="Branch width per depth for aux_loss='al_tree'. The "
+                         'per-depth factor becomes 1-(1-beta)^k_d. All ones '
+                         'reduces exactly to al_tv.')
+parser.add_argument('--greedy_tau', type=float, default=1.0,
+                    help="Logit-margin temperature for aux_loss='al_greedy_tree'. "
+                         "c = sigmoid((z(u) - kth_other_logit) / tau).")
+parser.add_argument('--altree_pos_per_seq', type=int, default=0,
+                    help="Windows kept per sequence for aux_loss='al_tree'. "
+                         '0 = all (~944). Set to 1/2/4 to match the sampled '
+                         "tree's anchor count and isolate supervision density.")
 parser.add_argument('--altv_topk', type=int, default=20,
                     help='K for al_tv_intersect_topk / al_tv_target_topk. Default 20.')
 parser.add_argument('--altv_topp', type=float, default=0.99,
@@ -435,6 +447,9 @@ if args.top_k_per_depth:
 model.coverage_lambda = args.coverage_lambda   # used by aux_loss='tree_ce'
 model.wk_bonus = args.wk_bonus                 # used by aux_loss='tree_altv_wk'
 model.tree_altv_mix = args.tree_altv_mix       # used by aux_loss='altv_p_tree_altv'
+model.altree_topk = [int(x) for x in args.altree_topk.split(',') if x.strip()]
+model.greedy_tau = args.greedy_tau
+model.altree_pos_per_seq = args.altree_pos_per_seq
 model.altv_topk = args.altv_topk               # used by aux_loss='al_tv_*_topk'
 model.altv_topp = args.altv_topp               # used by aux_loss='al_tv_target_topp'
 model.altv_focal_alpha = args.altv_focal_alpha # used by aux_loss='al_tv' focal weighting

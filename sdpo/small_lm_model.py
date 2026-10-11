@@ -217,7 +217,8 @@ class SmallLMDraftModel(nn.Module):
             f"anchor must be kl|ce|eal|none, got {anchor}"
         assert aux_loss in ('none', 'v2', 'v4', 'v4_w1', 'v4eal', 'v5', 'v6', 'v7', 'v8',
                             'tv', 'eal', 'eal_w1', 'peal',
-                            'al_tv', 'al_kl', 'wkl',
+                            'al_tv', 'al_tree', 'al_cover', 'al_greedy', 'al_greedy_tree',
+                            'al_kl', 'wkl',
                             'al_tv_intersect_topk', 'al_tv_target_topk',
                             'al_tv_target_topp',
                             'al_tv_target_topk_topp',
@@ -594,7 +595,13 @@ class SmallLMDraftModel(nn.Module):
             acc_length = (cum_prod * v6_w).sum(dim=-1)
             aux = -(acc_length * win_mask.float()).sum() / (nv_win + 1e-8)
 
-        elif aux_loss == 'eal':
+        elif aux_loss in ('eal', 'al_greedy'):
+            # Chain greedy surrogate. Hard 1{argmax q = argmax p} is constant
+            # almost everywhere, so the trained factor is the draft probability
+            # of the target mode:
+            #   b_t = q_t(u_t),  u_t = argmax p_t
+            #   E[L] = Σ_d Π_{j≤d} b_{t+j}
+            # 'eal' is the same expression.
             # Expected Accept Length:
             #   P_t = softmax(draft_logit_t)[target_argmax_t]    ∈ [0, 1]
             #   E[τ] = Σ_{k=1..γ-1} k · cum[k-1]·(1-P[k]) + γ · cum[γ-1]
@@ -672,6 +679,111 @@ class SmallLMDraftModel(nn.Module):
                 aux = -(acc_length * w_masked).sum() / w_masked.sum().clamp(min=1e-8)
             else:
                 aux = -(acc_length * win_mask.float()).sum() / (nv_win + 1e-8)
+
+        elif aux_loss == 'al_tree':
+            # Tree EAL with a full-vocabulary alpha.
+            # Under sampled drafting and ratio verification, the chance a slot
+            # advances, marginalised over which token the draft happens to
+            # draw, is sum_v q(v) min(1, p(v)/q(v)) = sum_v min(p,q) = 1 - TV,
+            # i.e. the same beta al_tv uses, and it is readable at every
+            # position straight off the prefill logits. The tree gives a slot
+            # k_d siblings and advances if any of them is accepted, so the
+            # per-depth factor becomes 1 - (1 - beta)^k_d, and summing the
+            # surviving prefix mass over depths is the same tail-sum
+            # E[L] = sum_d prod_{d'<=d} a_{d'} as the node-sum form.
+            # Compared with the sampled-tree alpha = min(p_v, q_v), each slot
+            # here covers the whole vocabulary instead of the k drawn tokens,
+            # at the cost of conditioning every depth on the teacher-forced
+            # prefix rather than on each branch's own continuation.
+            T = prob_temperature
+            target_p_T = F.softmax(target_lg / T, dim=-1) if T != 1.0 else target_p
+            draft_q = F.softmax(draft_lg / T, dim=-1)
+            beta = torch.sum(torch.min(target_p_T, draft_q), dim=-1)      # [B, L-1]
+            beta_stack = torch.stack(
+                [beta[:, k:k + usable] for k in range(gamma)], dim=-1)   # [B, U, γ]
+            topk_list = list(getattr(self, 'altree_topk', [1] * gamma))
+            if len(topk_list) < gamma:
+                topk_list = topk_list + [topk_list[-1]] * (gamma - len(topk_list))
+            k_dep = torch.tensor(topk_list[:gamma], device=beta.device,
+                                 dtype=beta_stack.dtype).view(1, 1, gamma)
+            a_tree = 1.0 - (1.0 - beta_stack).clamp(min=0.0, max=1.0) ** k_dep
+            cum_prod = torch.cumprod(a_tree, dim=-1)                    # [B, U, γ]
+            acc_length = (cum_prod * weights).sum(dim=-1)               # [B, U]
+            w = win_mask.float()
+            # Density knob: keep only n windows per sequence, so the number of
+            # supervised positions can be matched against the sampled tree's
+            # anchor count with everything else held fixed.
+            n_pos = int(getattr(self, 'altree_pos_per_seq', 0))
+            if n_pos > 0:
+                keep = torch.zeros_like(w)
+                for b in range(w.shape[0]):
+                    idx = w[b].nonzero(as_tuple=True)[0]
+                    if idx.numel() == 0:
+                        continue
+                    sel = idx[torch.randperm(int(idx.numel()),
+                                             device=idx.device)[:n_pos]]
+                    keep[b, sel] = 1.0
+                w = w * keep
+            aux = -(acc_length * w).sum() / w.sum().clamp(min=1e-8)
+
+        elif aux_loss == 'al_cover':
+            # One target draw per slot, siblings mutually exclusive: the slot
+            # advances when the draw lands in the k tokens the draft samples.
+            # P(miss v) ≈ (1 - q(v))^k, so
+            #   c = 1 - sum_v p(v) (1 - q(v))^k_d
+            # is the chance a slot of width k_d covers the draw. q = p is not
+            # the maximizer: the gradient k p(v) (1-q(v))^{k-1} piles q onto
+            # p's head, and a chain (k=1 everywhere) cannot use the wider
+            # shallow slots. E[L] is the same tail sum as al_tv.
+            T = prob_temperature
+            target_p_T = F.softmax(target_lg / T, dim=-1) if T != 1.0 else target_p
+            draft_q = F.softmax(draft_lg / T, dim=-1)
+            topk_list = list(getattr(self, 'altree_topk', [1] * gamma))
+            if len(topk_list) < gamma:
+                topk_list = topk_list + [topk_list[-1]] * (gamma - len(topk_list))
+            cols = []
+            one_minus_q = (1.0 - draft_q).clamp(min=0.0)
+            for d in range(gamma):
+                k = max(int(topk_list[d]), 1)
+                miss = one_minus_q if k == 1 else one_minus_q.pow(k)
+                c_d = 1.0 - (target_p_T * miss).sum(dim=-1)
+                cols.append(c_d[:, d:d + usable])
+                if k != 1:
+                    del miss
+            c_stack = torch.stack(cols, dim=-1).clamp(0.0, 1.0)
+            cum_prod = torch.cumprod(c_stack, dim=-1)
+            acc_length = (cum_prod * weights).sum(dim=-1)
+            aux = -(acc_length * win_mask.float()).sum() / (nv_win + 1e-8)
+
+        elif aux_loss == 'al_greedy_tree':
+            # Tree greedy surrogate. A slot of width k accepts when the target
+            # mode u sits in the draft's top-k. The hard membership test has
+            # zero gradient, so the factor is a sigmoid of the logit margin.
+            # The threshold is the k-th largest logit among tokens other than
+            # u, so u is not compared with itself:
+            #   c_d = σ((z_q(u) - z_(k_d)) / τ)
+            # E[L] is the same tail sum as al_tv. k_d = 1 is "u is rank 1".
+            topk_list = list(getattr(self, 'altree_topk', [1] * gamma))
+            if len(topk_list) < gamma:
+                topk_list = topk_list + [topk_list[-1]] * (gamma - len(topk_list))
+            k_max = max(max(int(k) for k in topk_list[:gamma]), 1)
+            tau = float(getattr(self, 'greedy_tau', 1.0))
+            lg = draft_lg.float()
+            u = target_argmax
+            masked = lg.scatter(
+                -1, u.unsqueeze(-1), torch.finfo(lg.dtype).min)
+            kth = masked.topk(k_max, dim=-1).values
+            z_u = lg.gather(-1, u.unsqueeze(-1)).squeeze(-1)
+            cols = []
+            for d in range(gamma):
+                k = max(int(topk_list[d]), 1)
+                thr = kth[:, d:d + usable, k - 1]
+                cols.append(torch.sigmoid((z_u[:, d:d + usable] - thr) / tau))
+            c_stack = torch.stack(cols, dim=-1)
+            cum_prod = torch.cumprod(c_stack, dim=-1)
+            acc_length = (cum_prod * weights).sum(dim=-1)
+            aux = -(acc_length * win_mask.float()).sum() / (nv_win + 1e-8)
+            del masked, kth
 
         elif aux_loss == 'al_tv_intersect_topk':
             # Variant 1: draft keeps only intersect(topK_draft, topK_target), zeros elsewhere.

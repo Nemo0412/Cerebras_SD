@@ -61,7 +61,7 @@ parser.add_argument('--temperature', type=float, default=1.0,
                          'probabilities. Draft tree stays greedy top-k.')
 parser.add_argument('--eal_mode', type=str, default='budget',
                     choices=['budget', 'path_topk', 'node_marginal', 'soft_topk',
-                             'sample_minpq'],
+                             'sample_minpq', 'sample_anyk', 'sample_cover', 'wsoft'],
                     help='budget: KL minus E[L] on the node-budget tree. '
                          'path_topk: KL minus exact E[L] on the Top-K path union. '
                          'node_marginal: old node-weighted NLL, not used. '
@@ -71,7 +71,37 @@ parser.add_argument('--eal_mode', type=str, default='budget',
                          'sample_minpq: draft samples the tree, α = min(p, q), '
                          'loss = -sum over nodes of prod α along the path. '
                          'Logged accept length is one realized eval-rule draw. '
-                         'Eval with --draft-mode sample --verify-mode ratio.')
+                         'Eval with --draft-mode sample --verify-mode ratio. '
+                         'sample_anyk: same sampled tree, but scored with the '
+                         'rule eval runs: each node accepted with min(1, p/q) '
+                         'and a slot advances if ANY sibling is accepted. Adds '
+                         'the score-function term for the tree sampling. '
+                         'sample_cover: sampled tree, one target draw per slot. '
+                         'Each slot is scored with 1 - sum_v p(v)(1-q(v))^k '
+                         'using only that slot\'s child count, so a wide root '
+                         'spreads and a deep node spikes. Eval with '
+                         '--draft-mode sample --verify-mode exclusive. '
+                         'wsoft: greedy top-k tree. Each candidate scores '
+                         'p(v) * sigmoid((z(v) - kth other logit) / tau). '
+                         'Candidates are the drafted children plus the target '
+                         'top-m left out of the tree. E[L] is the simple-verify '
+                         'survival recursion. Loss adds anchor_kl_coef * KL(p||q). '
+                         'Eval with --draft-mode argmax --verify-mode simple.')
+parser.add_argument('--greedy_tau', type=float, default=1.0,
+                    help='Temperature of the soft top-k score in eal_mode=wsoft.')
+parser.add_argument('--soft_target_m', type=int, default=4,
+                    help='Target tokens added beside the drafted children in '
+                         'eal_mode=wsoft. Tokens already in the draft top-k '
+                         'are not added twice.')
+parser.add_argument('--n_draws', type=int, default=1,
+                    help='Independent tree draws per anchor. sample_anyk needs '
+                         '>=2 for its score-function baseline.')
+parser.add_argument('--eal_score_coef', type=float, default=0.1,
+                    help='Weight of the score-function (sampling) term in '
+                         'sample_anyk. 0 keeps only the value term.')
+parser.add_argument('--n_anchors', type=int, default=1,
+                    help='Trees per sequence per step. >1 raises the supervision '
+                         'per sample and gives sample_anyk its baseline.')
 parser.add_argument('--path_topk', type=int, default=16,
                     help='K for path_topk, node_marginal, and soft_topk.')
 parser.add_argument('--local_rank', type=int, default=-1)
@@ -157,6 +187,8 @@ model = SmallLMTreeV2Model(
     dtype=model_dtype,
     tree_budget=(args.tree_budget if args.tree_budget > 0 else None),
 )
+model.greedy_tau = args.greedy_tau
+model.soft_target_m = args.soft_target_m
 
 args.deepspeed_config = None
 trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -265,6 +297,9 @@ for epoch in range(start_epoch, args.num_epochs):
             temperature=args.temperature,
             eal_mode=args.eal_mode,
             path_topk=args.path_topk,
+            eal_score_coef=args.eal_score_coef,
+            n_anchors=args.n_anchors,
+            n_draws=args.n_draws,
         )
         # Always backward+step (rank-safe). See memory.md 2026-04-21.
         model_engine.backward(total_loss)
@@ -338,6 +373,9 @@ for epoch in range(start_epoch, args.num_epochs):
                 temperature=args.temperature,
                 eal_mode=args.eal_mode,
                 path_topk=args.path_topk,
+                eal_score_coef=args.eal_score_coef,
+                n_anchors=args.n_anchors,
+                n_draws=args.n_draws,
             )
         if m["num_valid"] == 0 or m.get("num_anchors", 0) == 0:
             continue

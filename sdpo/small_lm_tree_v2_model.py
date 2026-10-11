@@ -123,6 +123,23 @@ def _pad_cache_batch(keys, values, batch_idx, kv_lens):
     return new_cache, max_kv
 
 
+def soft_topk_score(logits, token_ids, k, tau):
+    """Soft score that token_ids sit in the top-k of logits.
+
+    The threshold for each token is the k-th largest logit among the others,
+    so a token that is exactly rank k is not compared with itself.
+    logits: [B, G, V], token_ids: [B, G, C].
+    """
+    kk = max(int(k), 1)
+    vals, idx = logits.topk(kk + 1, dim=-1)
+    in_top = (token_ids.unsqueeze(-1) == idx[..., :kk].unsqueeze(-2)).any(-1)
+    boundary = vals[..., kk - 1]
+    nxt = vals[..., kk]
+    thr = torch.where(in_top, nxt.unsqueeze(-1), boundary.unsqueeze(-1))
+    z = logits.gather(-1, token_ids)
+    return torch.sigmoid((z - thr) / max(float(tau), 1e-6))
+
+
 def tree_expected_accepted_length(alpha, parents):
     """E[L_tree] for this repo's verify_tree_step simple rule.
 
@@ -174,6 +191,24 @@ def tree_expected_accepted_length(alpha, parents):
     return eal
 
 
+def _center_by_group(x, group):
+    """Standardise x within each group of draws sharing one anchor.
+
+    Groups with a single draw get zero: there is nothing to compare them to, so
+    they contribute only the value term.
+    """
+    if group is None:
+        group = list(range(x.numel()))
+    g = torch.as_tensor(group, device=x.device, dtype=torch.long)
+    n_g = int(g.max().item()) + 1 if g.numel() else 0
+    cnt = x.new_zeros(n_g).index_add_(0, g, torch.ones_like(x))
+    mean = x.new_zeros(n_g).index_add_(0, g, x) / cnt.clamp(min=1.0)
+    dev = x - mean[g]
+    var = x.new_zeros(n_g).index_add_(0, g, dev * dev) / (cnt - 1).clamp(min=1.0)
+    out = dev / var[g].sqrt().clamp(min=1e-3)
+    return torch.where(cnt[g] > 1, out, torch.zeros_like(out))
+
+
 def tree_path_sum_eal(alpha, parents):
     """E[L] = sum over nodes of prod of alpha along the root-to-node path.
 
@@ -200,6 +235,40 @@ def tree_path_sum_eal(alpha, parents):
         cum = torch.where(new, val, cum)
         assigned = assigned | new
     return cum.sum(dim=-1)
+
+
+def tree_path_mean_eal(alpha, parents):
+    """Mean over leaves of sum_d prod_{nodes on the path up to d} alpha.
+
+    alpha[node] is the factor for entering that node. When siblings share a
+    slot they carry the same alpha, and averaging leaves counts that shared
+    prefix once per path instead of once per sibling.
+    """
+    B, N = alpha.shape
+    if N == 0:
+        return alpha.new_zeros(B)
+    cum = alpha.new_zeros(B, N)
+    total = alpha.new_zeros(B, N)
+    is_root = parents < 0
+    assigned = torch.zeros(B, N, dtype=torch.bool, device=alpha.device)
+    for _ in range(N):
+        parent_cum = cum.gather(1, parents.clamp(min=0))
+        parent_total = total.gather(1, parents.clamp(min=0))
+        parent_ok = assigned.gather(1, parents.clamp(min=0)) | is_root
+        new = parent_ok & ~assigned
+        if not bool(new.any()):
+            break
+        this = torch.where(is_root, alpha, alpha * parent_cum)
+        cum = torch.where(new, this, cum)
+        total = torch.where(
+            new, torch.where(is_root, this, parent_total + this), total)
+        assigned = assigned | new
+    referred = torch.zeros(B, N, dtype=torch.bool, device=alpha.device)
+    valid_parent = parents >= 0
+    referred = referred.scatter(1, parents.clamp(min=0), valid_parent)
+    is_leaf = ~referred & assigned
+    denom = is_leaf.float().sum(dim=-1).clamp(min=1.0)
+    return (total * is_leaf.float()).sum(dim=-1) / denom
 
 
 def longest_path_from_accept(accept, parents):
@@ -675,7 +744,9 @@ class SmallLMTreeV2Model(nn.Module):
     def _rollout_batch(self, batch_idx, anchor_pos,
                        drf_anchor_logits, tgt_anchor_logits,
                        drf_keys, drf_values, tgt_keys, tgt_values,
-                       temperature, eal_mode="budget", path_topk=16):
+                       temperature, eal_mode="budget", path_topk=16,
+                       eal_score_coef=0.1, anchor_group=None,
+                       anchor_kl_coef=0.0):
         """Greedy top-k tree, global budget prune, batched across the microbatch.
 
         Returns mean KL over kept nodes and mean Tree-EAL. KL carries the draft
@@ -701,7 +772,7 @@ class SmallLMTreeV2Model(nn.Module):
         root_lp = F.log_softmax(drf_root, dim=-1)
         # sample_minpq: the draft SAMPLES k distinct children per node at T,
         # matching eval --draft-mode sample. Otherwise greedy top-k.
-        sample_tree = eal_mode == "sample_minpq"
+        sample_tree = eal_mode in ("sample_minpq", "sample_anyk", "sample_cover")
         if sample_tree:
             with torch.no_grad():
                 root_tok = torch.multinomial(
@@ -840,7 +911,9 @@ class SmallLMTreeV2Model(nn.Module):
             tgt_root.unsqueeze(1).expand(B, N, -1),
         )
 
-        if skip_full_logits or eal_mode in ("soft_topk", "sample_minpq"):
+        if skip_full_logits or eal_mode in (
+                "soft_topk", "sample_minpq", "sample_anyk", "sample_cover",
+                "wsoft"):
             kl = drf_root.new_zeros(())
         else:
             tgt_logp = F.log_softmax(tgt_node, dim=-1)
@@ -853,6 +926,36 @@ class SmallLMTreeV2Model(nn.Module):
             eal = tree_expected_accepted_length(alpha, parents).mean()
             n_report = int(N)
             eal_loss = None
+        elif eal_mode == "sample_anyk":
+            # Sampled tree scored with the rule eval actually runs: every node
+            # is accepted independently with min(1, p/q) and the longest fully
+            # accepted prefix is kept, so a slot advances when ANY sibling is
+            # accepted. tree_expected_accepted_length is that survival
+            # recursion, so E[L | tree] is exact. A chain has one sibling per
+            # slot and cannot express this term.
+            tok_idx = tokens.long().unsqueeze(-1)
+            p_node = torch.softmax(tgt_node / T, dim=-1).gather(-1, tok_idx).squeeze(-1)
+            log_q = torch.log_softmax(drf_node / T, dim=-1).gather(-1, tok_idx).squeeze(-1)
+            alpha = (p_node.detach() / log_q.exp().clamp(min=1e-9)).clamp(max=1.0)
+            eal_cond = tree_expected_accepted_length(alpha, parents)
+            # alpha falls as q rises, so the value term alone would shrink q to
+            # inflate p/q. Which tokens enter the tree also depends on q, and
+            # that path is the score-function term below; together they are the
+            # gradient of E_{tree~q}[L]. log q of the sampled set is averaged
+            # per node, because the raw sum over 128 nodes reaches -1500 on tail
+            # tokens and under grad clipping leaves nothing of the value term.
+            # The weight is E[L | tree] (same expectation as one draw, less
+            # noise) centred over the draws at the same anchor.
+            score = log_q.mean(dim=1)
+            adv = _center_by_group(eal_cond.detach(), anchor_group)
+            eal_loss = -(eal_cond.mean()
+                         + eal_score_coef * (adv * score).mean())
+            with torch.no_grad():
+                a = alpha.detach()
+                draws = [longest_path_from_accept(torch.rand_like(a) <= a, parents)
+                         for _ in range(16)]
+                eal = torch.stack(draws).mean()
+            n_report = int(N)
         elif eal_mode == "sample_minpq":
             # Sampled tree. alpha_v = min(p_v, q_v): the chance the draft
             # samples v and the ratio test accepts it. Siblings are mutually
@@ -870,6 +973,113 @@ class SmallLMTreeV2Model(nn.Module):
                 accept = torch.rand_like(ratio) <= ratio
                 eal = longest_path_from_accept(accept, parents)
             n_report = int(N)
+        elif eal_mode == "sample_cover":
+            # One target draw per slot, siblings mutually exclusive. The cover
+            # of a slot is c = 1 - sum_v p(v) (1-q(v))^k with k equal to that
+            # slot's child count only. A root (k=4) is trained to spread over
+            # p's head and a deep node (k=1) is trained to spike, and those
+            # gradients land on different prefixes. c is the factor for
+            # entering each node; siblings share their parent's c. E[L] is the
+            # mean over leaves of the tail sum along the path.
+            c = drf_node.new_empty(B, N)
+            accept = torch.zeros(B, N, dtype=torch.bool, device=device)
+            for d, cnt in enumerate(depth_counts):
+                start = depth_starts[d]
+                end = min(start + cnt, N)
+                if start >= end:
+                    break
+                k = max(int(top_k[d]), 1)
+                p_sl = torch.softmax(tgt_node[:, start:end] / T, dim=-1)
+                q_sl = torch.softmax(drf_node[:, start:end] / T, dim=-1)
+                miss = (1.0 - q_sl).clamp(min=0.0)
+                if k != 1:
+                    miss = miss.pow(k)
+                c[:, start:end] = (1.0 - (p_sl * miss).sum(dim=-1)).clamp(0.0, 1.0)
+                n_here = end - start
+                tok = tokens[:, start:end]
+                with torch.no_grad():
+                    p_draw = p_sl.detach()
+                    if k == 1 or n_here % k != 0:
+                        draw = torch.multinomial(
+                            p_draw.reshape(B * n_here, -1), 1).view(B, n_here)
+                    else:
+                        n_groups = n_here // k
+                        draw = torch.multinomial(
+                            p_draw[:, ::k].reshape(B * n_groups, -1), 1).view(B, n_groups)
+                        draw = draw.repeat_interleave(k, dim=1)
+                    accept[:, start:end] = tok.long() == draw
+                del p_sl, q_sl, miss
+            eal_loss = -tree_path_mean_eal(c, parents).mean()
+            with torch.no_grad():
+                eal = longest_path_from_accept(accept, parents)
+            n_report = int(N)
+        elif eal_mode == "wsoft":
+            # Weighted soft top-k Tree EAL for verify-mode simple: several
+            # children of one slot can pass, so
+            #   S_h(d) = 1 - prod_v (1 - p(v) s_v S_v(d-1))
+            # with s_v = sigmoid((z_q(v) - z_(k)^{-v}) / tau). tree_expected_
+            # accepted_length is that recursion. Candidates are the drafted
+            # top-k, which have a real subtree, plus the target's top-m tokens
+            # that the draft left out. Those extras are leaves: they receive a
+            # gradient for entering the top-k, and their continuation is the
+            # depth-1 approximation. Loss = -E[L] + kl_coef * KL(p || q).
+            tau = float(getattr(self, "greedy_tau", 1.0))
+            mix_m = max(int(getattr(self, "soft_target_m", 4)), 1)
+            kl_coef = float(anchor_kl_coef)
+            alpha = drf_node.new_zeros(B, N)
+            p_draft = drf_node.new_zeros(B, N)
+            extra_alpha = []
+            extra_parents = []
+            kl_sum = drf_node.new_zeros(())
+            kl_count = 0
+            for d, cnt in enumerate(depth_counts):
+                start = depth_starts[d]
+                end = min(start + cnt, N)
+                if start >= end:
+                    break
+                k = max(int(top_k[d]), 1)
+                n_here = end - start
+                if n_here % k != 0:
+                    raise RuntimeError(
+                        f"wsoft depth {d} has {n_here} nodes, not a multiple of k={k}")
+                groups = n_here // k
+                drf_g = drf_node[:, start:end].contiguous().view(
+                    B, groups, k, -1)[:, :, 0, :]
+                tgt_g = tgt_node[:, start:end].contiguous().view(
+                    B, groups, k, -1)[:, :, 0, :]
+                tok = tokens[:, start:end].contiguous().view(B, groups, k).long()
+                log_q = F.log_softmax(drf_g, dim=-1)
+                log_p = F.log_softmax(tgt_g, dim=-1)
+                kl_g = (log_p.exp() * (log_p - log_q)).sum(-1).clamp(min=0.0)
+                kl_sum = kl_sum + kl_g.sum()
+                kl_count += int(kl_g.numel())
+                s_tok = soft_topk_score(drf_g, tok, k, tau)
+                p_tok = log_p.gather(-1, tok).exp()
+                alpha[:, start:end] = (p_tok.detach() * s_tok).reshape(B, n_here)
+                p_draft[:, start:end] = p_tok.detach().reshape(B, n_here)
+                tgt_idx = tgt_g.detach().topk(mix_m, dim=-1).indices
+                in_draft = (tgt_idx.unsqueeze(-1) == tok.unsqueeze(-2)).any(-1)
+                s_extra = soft_topk_score(drf_g, tgt_idx, k, tau)
+                p_extra = log_p.gather(-1, tgt_idx).exp()
+                a_extra = torch.where(
+                    in_draft, torch.zeros_like(p_extra), p_extra.detach() * s_extra)
+                extra_alpha.append(a_extra.reshape(B, groups * mix_m))
+                if d == 0:
+                    par = torch.full(
+                        (B, groups * mix_m), -1, device=device, dtype=torch.long)
+                else:
+                    par = parents[:, start:end:k].repeat_interleave(mix_m, dim=1)
+                extra_parents.append(par)
+                del log_q, log_p, drf_g, tgt_g
+            kl = kl_sum / max(kl_count, 1)
+            alpha_ext = torch.cat([alpha] + extra_alpha, dim=1)
+            parents_ext = torch.cat([parents] + extra_parents, dim=1)
+            eal_soft = tree_expected_accepted_length(alpha_ext, parents_ext)
+            eal_loss = -eal_soft.mean() + kl_coef * kl
+            with torch.no_grad():
+                accept = torch.rand_like(p_draft) <= p_draft
+                eal = longest_path_from_accept(accept, parents)
+            n_report = int(alpha_ext.size(1))
         elif eal_mode in ("path_topk", "node_marginal", "soft_topk"):
             n_paths = depth_counts[-1]
             if full_leaf_sc is None or full_leaf_sc.size(1) != n_paths:
@@ -935,7 +1145,8 @@ class SmallLMTreeV2Model(nn.Module):
         else:
             raise ValueError(
                 "eal_mode must be 'budget', 'path_topk', 'node_marginal', "
-                f"'soft_topk', or 'sample_minpq', got {eal_mode}")
+                f"'soft_topk', 'sample_minpq', 'sample_anyk', "
+                f"'sample_cover', or 'wsoft', got {eal_mode}")
         return {
             "kl": kl,
             "eal": eal,
@@ -945,19 +1156,37 @@ class SmallLMTreeV2Model(nn.Module):
 
     def forward(self, input_ids, attention_mask, loss_mask,
                 anchor_kl_coef=1.0, eal_aux_coef=0.1, temperature=1.0,
-                eal_mode="budget", path_topk=16, **kwargs):
+                eal_mode="budget", path_topk=16, n_anchors=1, n_draws=1,
+                eal_score_coef=0.1, **kwargs):
         B, L = input_ids.shape
         device = input_ids.device
 
+        # n_anchors distinct trees per sequence. One tree per sequence covers
+        # a single position out of ~900 supervised ones, which is far less
+        # signal per step than the chain losses get.
+        # n_draws independent trees per anchor. The score-function baseline has
+        # to compare draws at the same position: positions differ in difficulty
+        # much more than two draws at one position do, so a baseline taken
+        # across positions measures "was this position easy" and inflates the
+        # draft entropy instead of steering the sampling.
+        n_anchors = max(int(n_anchors), 1)
+        n_draws = max(int(n_draws), 1)
         batch_idx = []
         anchor_pos = []
+        anchor_group = []
+        n_groups = 0
         for b in range(B):
             valid = (loss_mask[b] == 1).nonzero(as_tuple=True)[0]
             if len(valid) == 0:
                 continue
-            r = int(torch.randint(0, len(valid), (1,)).item())
-            batch_idx.append(b)
-            anchor_pos.append(int(valid[r].item()))
+            k = min(n_anchors, int(valid.numel()))
+            sel = torch.randperm(int(valid.numel()), device=valid.device)[:k]
+            for s in sel.tolist():
+                for _ in range(n_draws):
+                    batch_idx.append(b)
+                    anchor_pos.append(int(valid[s].item()))
+                    anchor_group.append(n_groups)
+                n_groups += 1
 
         def _rows(logits):
             b_t = torch.tensor(batch_idx, device=logits.device, dtype=torch.long)
@@ -995,8 +1224,12 @@ class SmallLMTreeV2Model(nn.Module):
         out = self._rollout_batch(
             batch_idx, anchor_pos, drf_anchor, tgt_anchor,
             drf_keys, drf_values, tgt_keys, tgt_values, temperature,
-            eal_mode=eal_mode, path_topk=path_topk)
-        if eal_mode in ("node_marginal", "soft_topk", "sample_minpq"):
+            eal_mode=eal_mode, path_topk=path_topk,
+            eal_score_coef=eal_score_coef, anchor_group=anchor_group,
+            anchor_kl_coef=anchor_kl_coef)
+
+        if eal_mode in ("node_marginal", "soft_topk", "sample_minpq",
+                        "sample_anyk", "sample_cover", "wsoft"):
             total_loss = out["eal_loss"]
             if dense_loss is not None:
                 total_loss = total_loss + dense_loss

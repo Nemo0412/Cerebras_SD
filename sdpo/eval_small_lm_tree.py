@@ -436,12 +436,13 @@ def main():
                         action='store_false',
                         help='Disable Qwen3 thinking mode in chat template.')
     parser.add_argument('--verify-mode',
-                        choices=['auto', 'greedy', 'simple', 'ratio', 'ratio_fix'],
+                        choices=['auto', 'greedy', 'simple', 'ratio', 'ratio_fix', 'exclusive'],
                         default='auto',
                         help='Target verify rule: auto=greedy if T=0 else simple; '
                              'greedy=argmax match; simple=r ≤ p_t; ratio=r ≤ p_t/p_d; '
                              'ratio_fix=ratio + correction from normalize(max(0, p_t - p_d)) '
-                             '(exact SpecDec correction).')
+                             '(exact SpecDec correction); exclusive=one draw from p per '
+                             'slot, siblings mutually exclusive.')
     args = parser.parse_args()
 
     # Parse top_k (int or comma-separated list)

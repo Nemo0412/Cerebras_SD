@@ -1440,7 +1440,7 @@ def verify_tree_step(
     if eff_verify == 'auto':
         eff_verify = 'greedy' if temperature == 0.0 else 'simple'
 
-    if eff_verify in ('simple', 'ratio', 'ratio_fix'):
+    if eff_verify in ('simple', 'ratio', 'ratio_fix', 'exclusive'):
         T_v = max(temperature, 1e-6)
         probs = torch.softmax(logits / T_v, dim=-1)
         if target_top_k > 0:
@@ -1451,17 +1451,26 @@ def verify_tree_step(
         is_ratio = eff_verify in ('ratio', 'ratio_fix')
         tree_probs_cpu = tree.probs.cpu().tolist() if (is_ratio and tree.probs is not None) else None
         accept_node = [False] * n
+        # exclusive: one target draw per slot, shared by siblings, so at most
+        # one sibling matches. q=p is then not the optimum — a draft that puts
+        # its mass on p's head covers the draw more often than q=p does.
+        drawn = {}
         for i in range(n):
             p = parents_cpu[i]
             pos_for_check = 0 if p < 0 else (1 + p)
             token = tree_tokens_cpu[i]
-            p_t = probs_cpu[pos_for_check, token].item()
-            if eff_verify == 'simple':
-                accept_node[i] = (random.random() <= p_t)
-            else:  # 'ratio' or 'ratio_fix'
-                p_d = tree_probs_cpu[i] if tree_probs_cpu else 1.0
-                ratio = min(1.0, p_t / max(p_d, 1e-20))
-                accept_node[i] = (random.random() <= ratio)
+            if eff_verify == 'exclusive':
+                if pos_for_check not in drawn:
+                    drawn[pos_for_check] = int(torch.multinomial(probs_cpu[pos_for_check], 1).item())
+                accept_node[i] = (token == drawn[pos_for_check])
+            else:
+                p_t = probs_cpu[pos_for_check, token].item()
+                if eff_verify == 'simple':
+                    accept_node[i] = (random.random() <= p_t)
+                else:  # 'ratio' or 'ratio_fix'
+                    p_d = tree_probs_cpu[i] if tree_probs_cpu else 1.0
+                    ratio = min(1.0, p_t / max(p_d, 1e-20))
+                    accept_node[i] = (random.random() <= ratio)
         best_accepted = 0
         best_path = []
         for path in paths:

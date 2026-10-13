@@ -913,7 +913,7 @@ class SmallLMTreeV2Model(nn.Module):
 
         if skip_full_logits or eal_mode in (
                 "soft_topk", "sample_minpq", "sample_anyk", "sample_cover",
-                "wsoft"):
+                "wsoft", "greedy_topk"):
             kl = drf_root.new_zeros(())
         else:
             tgt_logp = F.log_softmax(tgt_node, dim=-1)
@@ -1080,6 +1080,36 @@ class SmallLMTreeV2Model(nn.Module):
                 accept = torch.rand_like(p_draft) <= p_draft
                 eal = longest_path_from_accept(accept, parents)
             n_report = int(alpha_ext.size(1))
+        elif eal_mode == "greedy_topk":
+            # Greedy top-k tree. Rank complete paths by the product of the
+            # draft probabilities of their nodes (full_leaf_sc is the sum of
+            # those log-probs) and keep path_topk of them.
+            # On each kept path the chain factor is the draft probability of
+            # the target argmax at that node:
+            #   P_j = q_j(argmax p_j)
+            #   chain EAL = Σ_d Π_{j≤d} P_j
+            # The trained tree EAL is the sum of those chain EALs.
+            # The logged accept length is the max, which is the single path
+            # a greedy decode would keep.
+            if last_sel is not None or full_leaf_sc is None:
+                raise RuntimeError(
+                    "greedy_topk scores every complete path, so tree_budget "
+                    "must cover the full tree")
+            if full_leaf_sc.size(1) != self.paths.size(0):
+                raise RuntimeError(
+                    f"path scores {full_leaf_sc.size(1)} != paths {self.paths.size(0)}")
+            q_node = torch.softmax(drf_node, dim=-1)
+            target_mode = tgt_node.argmax(dim=-1)
+            factor = q_node.gather(-1, target_mode.unsqueeze(-1)).squeeze(-1)
+            k_paths = min(int(path_topk), int(full_leaf_sc.size(1)))
+            chosen = self.paths[full_leaf_sc.detach().topk(k_paths, dim=-1).indices]
+            factors = factor.gather(1, chosen.reshape(B, -1)).view(B, k_paths, gamma)
+            chain_eal = torch.cumprod(factors, dim=-1).sum(dim=-1)
+            eal_loss = -chain_eal.sum(dim=-1).mean()
+            with torch.no_grad():
+                eal = chain_eal.max(dim=-1).values.mean()
+            n_report = k_paths
+            del q_node
         elif eal_mode in ("path_topk", "node_marginal", "soft_topk"):
             n_paths = depth_counts[-1]
             if full_leaf_sc is None or full_leaf_sc.size(1) != n_paths:
@@ -1229,7 +1259,7 @@ class SmallLMTreeV2Model(nn.Module):
             anchor_kl_coef=anchor_kl_coef)
 
         if eal_mode in ("node_marginal", "soft_topk", "sample_minpq",
-                        "sample_anyk", "sample_cover", "wsoft"):
+                        "sample_anyk", "sample_cover", "wsoft", "greedy_topk"):
             total_loss = out["eal_loss"]
             if dense_loss is not None:
                 total_loss = total_loss + dense_loss

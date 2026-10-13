@@ -61,7 +61,8 @@ parser.add_argument('--temperature', type=float, default=1.0,
                          'probabilities. Draft tree stays greedy top-k.')
 parser.add_argument('--eal_mode', type=str, default='budget',
                     choices=['budget', 'path_topk', 'node_marginal', 'soft_topk',
-                             'sample_minpq', 'sample_anyk', 'sample_cover', 'wsoft'],
+                             'sample_minpq', 'sample_anyk', 'sample_cover', 'wsoft',
+                             'greedy_topk'],
                     help='budget: KL minus E[L] on the node-budget tree. '
                          'path_topk: KL minus exact E[L] on the Top-K path union. '
                          'node_marginal: old node-weighted NLL, not used. '
@@ -86,7 +87,14 @@ parser.add_argument('--eal_mode', type=str, default='budget',
                          'Candidates are the drafted children plus the target '
                          'top-m left out of the tree. E[L] is the simple-verify '
                          'survival recursion. Loss adds anchor_kl_coef * KL(p||q). '
-                         'Eval with --draft-mode argmax --verify-mode simple.')
+                         'Eval with --draft-mode argmax --verify-mode simple. '
+                         'greedy_topk: greedy top-k tree. Keep the --path_topk '
+                         'paths with the largest product of draft node '
+                         'probabilities. Each path is a chain EAL, '
+                         'P_j = q_j(argmax p_j), E[L] = sum_d prod_{j<=d} P_j. '
+                         'Loss is minus the sum of those chain EALs. The logged '
+                         'accept length is the max of them. '
+                         'Eval with --draft-mode argmax --verify-mode greedy.')
 parser.add_argument('--greedy_tau', type=float, default=1.0,
                     help='Temperature of the soft top-k score in eal_mode=wsoft.')
 parser.add_argument('--soft_target_m', type=int, default=4,
@@ -103,7 +111,8 @@ parser.add_argument('--n_anchors', type=int, default=1,
                     help='Trees per sequence per step. >1 raises the supervision '
                          'per sample and gives sample_anyk its baseline.')
 parser.add_argument('--path_topk', type=int, default=16,
-                    help='K for path_topk, node_marginal, and soft_topk.')
+                    help='How many paths to keep. Used by path_topk, '
+                         'node_marginal, soft_topk, and greedy_topk.')
 parser.add_argument('--local_rank', type=int, default=-1)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -239,7 +248,7 @@ if ckpt_path:
 
 step_log_path = os.path.join(args.savedir, "train_steps.jsonl")
 epoch_log_path = os.path.join(args.savedir, "epoch_metrics.jsonl")
-eval_sbatch = "/scratch/ll5914/logs/tree_eal/eval_soft_topk_epoch.sbatch"
+eval_sbatch = os.environ.get("EVAL_SBATCH", "")
 
 
 def _append_jsonl(path, row):
@@ -249,7 +258,9 @@ def _append_jsonl(path, row):
 
 
 def _submit_epoch_eval(epoch):
-    """Queue the real verify_tree_step eval for this epoch's draft."""
+    """Queue verify_tree_step eval only when EVAL_SBATCH is set."""
+    if not eval_sbatch:
+        return None
     if not os.path.isfile(eval_sbatch):
         print(f"  epoch {epoch} | eval sbatch missing: {eval_sbatch}")
         return None

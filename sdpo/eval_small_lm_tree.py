@@ -88,6 +88,7 @@ def spec_decode_tree_smalllm(
     temperature=0.0,
     draft_mode='argmax', verify_mode='auto',
     draft_top_k_vocab=0, target_top_k=0,
+    path_topk=0,
 ):
     """Tree spec decode with INCREMENTAL KV on BOTH draft and target.
 
@@ -125,7 +126,8 @@ def spec_decode_tree_smalllm(
 
         new_tokens, n_acc, tt, target_state, best_path = verify_tree_step(
             target_model, target_state, tree, temperature=temperature,
-            verify_mode=verify_mode, target_top_k=target_top_k)
+            verify_mode=verify_mode, target_top_k=target_top_k,
+            path_topk=path_topk)
         total_target_time += tt
 
         # Truncate draft cache to [prefix][pending][accepted_path], same layout
@@ -435,6 +437,10 @@ def main():
     parser.add_argument('--no-thinking', dest='enable_thinking',
                         action='store_false',
                         help='Disable Qwen3 thinking mode in chat template.')
+    parser.add_argument('--path-topk', type=int, default=0,
+                        help='If >0, only the paths with the largest product of '
+                             'draft node probabilities are verified. Accept length '
+                             'is the longest target-argmax prefix among them.')
     parser.add_argument('--verify-mode',
                         choices=['auto', 'greedy', 'simple', 'ratio', 'ratio_fix', 'exclusive'],
                         default='auto',
@@ -599,7 +605,8 @@ def main():
                 draft_mode=args.draft_mode,
                 verify_mode=args.verify_mode,
                 draft_top_k_vocab=args.draft_top_k,
-                target_top_k=args.target_top_k)
+                target_top_k=args.target_top_k,
+                path_topk=args.path_topk)
             for k in agg:
                 agg[k] += r[k]
             all_al.extend(r.get("accept_lengths", []))

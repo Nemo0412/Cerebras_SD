@@ -23,6 +23,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 
 import deepspeed
@@ -53,6 +54,14 @@ parser.add_argument('--savedir', default='/scratch/tx856/spec_reason/scratch/los
 parser.add_argument('--save_epochs', type=str, default=None,
                     help='Comma-separated 0-indexed epoch indices to save (e.g. "2,5"). '
                          'Default: save every epoch.')
+parser.add_argument('--save_every_steps', type=int, default=0,
+                    help='Save a resumable DeepSpeed checkpoint (weights, optimizer, '
+                         'scheduler) into savedir/mid every N micro-batches and at '
+                         'each epoch end; a restarted job resumes from it. Rounded up '
+                         'to a multiple of gradient_accumulation_steps. 0 disables.')
+parser.add_argument('--resume_micro_bs', type=int, default=0,
+                    help='Per-GPU micro batch of the run that wrote savedir/mid, for '
+                         'checkpoints saved before progress.json recorded it.')
 parser.add_argument('--save_steps', type=int, default=0,
                     help='If >0, also save mid-epoch every N global steps '
                          '(as state_step{N}). Useful for slow training that may '
@@ -61,7 +70,8 @@ parser.add_argument('--sigmoid_coef', type=float, default=0.1)
 parser.add_argument('--T_max', type=float, default=0.1)
 parser.add_argument('--T_min', type=float, default=0.1)
 parser.add_argument('--prob_T_max', type=float, default=1.0,
-                    help='Initial T applied to softmax(z/T) for AL_TV / AL_KL / WKL aux losses. '
+                    help='Initial T applied to softmax(z/T) for AL_TV / AL_KL / WKL, '
+                         'and for al_greedy P = softmax(z/T)[target argmax]. '
                          'Linearly anneals to --prob_T_min over training. Default 1.0 (no schedule).')
 parser.add_argument('--prob_T_min', type=float, default=1.0,
                     help='Final T for prob-space losses (end of training). '
@@ -91,7 +101,11 @@ parser.add_argument('--anchor', type=str, default='kl',
 parser.add_argument('--aux_loss', type=str, default='v2',
                     choices=['none', 'v2', 'v4', 'v4_w1', 'v4eal', 'v5', 'v6', 'v7', 'v8',
                              'tv', 'eal', 'eal_w1', 'peal',
-                             'al_tv', 'al_tree', 'al_cover', 'al_greedy', 'al_greedy_tree',
+                             'al_tv', 'al_tree', 'al_cover', 'al_greedy', 'al_greedy_wce',
+                             'al_greedy_wce_start', 'al_greedy_margin',
+                             'al_greedy_wkl', 'al_greedy_wkl_start',
+                             'al_greedy_tree', 'al_greedy_tree_v4',
+                             'al_tree_greedy',
                              'al_kl', 'wkl',
                              'al_tv_intersect_topk', 'al_tv_target_topk',
                              'al_tv_target_topp',
@@ -105,7 +119,9 @@ parser.add_argument('--aux_loss', type=str, default='v2',
                     help='Auxiliary loss: none / v2 / v4 / v5 / v6 / v7 / v8 / tv / eal / '
                          'peal / al_tv / al_kl / wkl / tree_v4 / tree_altv / tree_ce / '
                          'tree_altv_wk / tree_ce_hard / tree_ce_soft / altv_p_tree_altv / '
-                         'topk_softce. tree_* variants require --top_k_per_depth.')
+                         'topk_softce. tree_* variants require --top_k_per_depth. '
+                         'al_greedy_wce: CE on the target argmax, each position '
+                         'weighted by the detached dE[L]/dP_t of al_greedy.')
 parser.add_argument('--anchor_weight', type=str, default='none',
                     choices=['none', 'uniform', 'pow08', 'dec', 'inc', 'v6'],
                     help='Per-step weight scheme for anchor (KL/CE). '
@@ -139,8 +155,10 @@ parser.add_argument('--altree_topk', type=str, default='4,3,2,1,1,1,1',
                          'per-depth factor becomes 1-(1-beta)^k_d. All ones '
                          'reduces exactly to al_tv.')
 parser.add_argument('--greedy_tau', type=float, default=1.0,
-                    help="Logit-margin temperature for aux_loss='al_greedy_tree'. "
-                         "c = sigmoid((z(u) - kth_other_logit) / tau).")
+                    help="Logit-margin temperature. al_greedy_tree uses the "
+                         "k-th other logit. al_tree_greedy uses the mean of "
+                         "the top-k other logits: "
+                         "c = sigmoid((z(u) - mean_topk_other) / tau).")
 parser.add_argument('--altree_pos_per_seq', type=int, default=0,
                     help="Windows kept per sequence for aux_loss='al_tree'. "
                          '0 = all (~944). Set to 1/2/4 to match the sampled '
@@ -403,6 +421,9 @@ if args.lr is not None:
 samples_per_gpu = math.ceil(len(traindataset) / n_gpus)
 iters_per_epoch = math.ceil(samples_per_gpu / micro_bs)
 total_iters = iters_per_epoch * args.num_epochs
+save_every = args.save_every_steps
+if save_every > 0:
+    save_every = math.ceil(save_every / grad_accum) * grad_accum
 
 print(f"[SmallLM] {len(traindataset)} samples, {n_gpus} GPUs, "
       f"effective_bs={effective_bs}, {steps_per_epoch} steps/epoch, "
@@ -496,9 +517,28 @@ if global_rank == 0:
     })
 
 os.makedirs(args.savedir, exist_ok=True)
-train_sampler = DistributedSampler(traindataset, num_replicas=world_size,
-                                   rank=global_rank, shuffle=True,
-                                   seed=args.seed)
+class _SkipSampler(torch.utils.data.Sampler):
+    """DistributedSampler that drops the first `skip_batches` micro-batches."""
+
+    def __init__(self, base, batch_size):
+        self.base = base
+        self.batch_size = batch_size
+        self.skip_batches = 0
+
+    def set_epoch(self, epoch):
+        self.base.set_epoch(epoch)
+
+    def __iter__(self):
+        return iter(list(self.base)[self.skip_batches * self.batch_size:])
+
+    def __len__(self):
+        return max(len(self.base) - self.skip_batches * self.batch_size, 0)
+
+
+train_sampler = _SkipSampler(
+    DistributedSampler(traindataset, num_replicas=world_size,
+                       rank=global_rank, shuffle=True, seed=args.seed),
+    micro_bs)
 test_sampler = DistributedSampler(testdataset, num_replicas=world_size,
                                   rank=global_rank, shuffle=False,
                                   seed=args.seed)
@@ -509,25 +549,111 @@ test_loader = DataLoader(testdataset, batch_size=micro_bs,
                          sampler=test_sampler, num_workers=0,
                          pin_memory=True, collate_fn=DataCollator())
 
-ckpt_path, start_epoch = find_latest_checkpoint(args.savedir)
-if ckpt_path:
-    print(f"[SmallLM] Resuming from {ckpt_path}")
-    model_engine.load_checkpoint(ckpt_path)
+mid_dir = os.path.join(args.savedir, "mid")
+mid_meta = os.path.join(mid_dir, "progress.json")
+resume_skip = 0
+global_step = 0
+if save_every > 0:
+    # state_N only holds 16-bit weights; resuming goes through mid/ alone.
+    start_epoch = 0
+    if os.path.isfile(mid_meta):
+        with open(mid_meta) as f:
+            mid_progress = json.load(f)
+        print(f"[SmallLM] Resuming from {mid_dir}/{mid_progress['tag']}")
+        model_engine.load_checkpoint(mid_dir, tag=mid_progress["tag"],
+                                     load_module_strict=False)
+        start_epoch = mid_progress["epoch"]
+        # batches_done counts micro-batches of the run that saved it.
+        saved_micro = mid_progress.get("micro_bs", args.resume_micro_bs or micro_bs)
+        resume_skip = mid_progress["batches_done"] * saved_micro // micro_bs
+        global_step = mid_progress["global_step"]
+else:
+    ckpt_path, start_epoch = find_latest_checkpoint(args.savedir)
+    if ckpt_path:
+        print(f"[SmallLM] Resuming from {ckpt_path}")
+        model_engine.load_checkpoint(ckpt_path)
+
+step_log_path = os.path.join(args.savedir, "train_steps.jsonl")
+epoch_log_path = os.path.join(args.savedir, "epoch_metrics.jsonl")
+if global_rank == 0 and os.path.isfile(step_log_path):
+    # Steps logged after the checkpoint we resume from are replayed, so drop them.
+    with open(step_log_path) as f:
+        kept = [ln for ln in f
+                if ln.strip() and json.loads(ln).get("step", 0) <= global_step]
+    with open(step_log_path, "w") as f:
+        f.writelines(kept)
+
+
+def _save_mid(epoch, batches_done):
+    tag = f"e{epoch}_b{batches_done}"
+    model_engine.save_checkpoint(mid_dir, tag=tag, exclude_frozen_parameters=True)
+    deepspeed.comm.barrier()
+    if global_rank == 0:
+        prev_tag = None
+        if os.path.isfile(mid_meta):
+            with open(mid_meta) as f:
+                prev_tag = json.load(f).get("tag")
+        tmp = mid_meta + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"tag": tag, "epoch": epoch, "batches_done": batches_done,
+                       "global_step": global_step, "micro_bs": micro_bs}, f)
+        os.replace(tmp, mid_meta)
+        if prev_tag and prev_tag != tag:
+            shutil.rmtree(os.path.join(mid_dir, prev_tag), ignore_errors=True)
+        print(f"  [resumable save] {mid_dir}/{tag}  step={global_step}", flush=True)
+    deepspeed.comm.barrier()
+
+
+def _append_jsonl(path, row):
+    with open(path, "a") as f:
+        f.write(json.dumps(row) + "\n")
+        f.flush()
+
+
+def _submit_epoch_eval(epoch):
+    """Queue an accept-length eval only when EVAL_SBATCH is set."""
+    eval_sbatch = os.environ.get("EVAL_SBATCH", "")
+    if not eval_sbatch or not os.path.isfile(eval_sbatch):
+        return None
+    partition = os.environ.get("EVAL_PARTITION") or os.environ.get("SLURM_JOB_PARTITION", "")
+    account = os.environ.get("EVAL_ACCOUNT") or os.environ.get("SLURM_JOB_ACCOUNT", "")
+    cmd = ["sbatch", "--parsable",
+           f"--job-name=chain_ev_e{epoch}",
+           f"--export=ALL,EPOCH={epoch}"]
+    if partition:
+        cmd.append(f"--partition={partition}")
+    if account:
+        cmd.append(f"--account={account}")
+    cmd.append(eval_sbatch)
+    try:
+        out = subprocess.check_output(cmd, text=True).strip()
+    except subprocess.CalledProcessError as exc:
+        print(f"  epoch {epoch} | eval submit failed: {exc}")
+        return None
+    print(f"  epoch {epoch} | queued accept-length eval job {out}")
+    return out
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-global_step = 0
 for epoch in range(start_epoch, args.num_epochs):
     train_sampler.set_epoch(epoch + 1)
+    train_sampler.skip_batches = resume_skip
     model.train()
-    print(f"[SmallLM] Epoch {epoch}")
+    print(f"[SmallLM] Epoch {epoch}"
+          + (f" (resuming after batch {resume_skip})" if resume_skip else ""))
 
     epoch_metrics = {"aux_loss": [], "eagle_loss": [], "grpo_loss": [], "mean_tau": []}
     epoch_step_acc = [[] for _ in range(args.gamma)]
     epoch_tau_hist = [0] * (args.gamma + 1)
 
-    for data in tqdm(train_loader, desc=f"Epoch {epoch} train"):
+    for batch_idx, data in enumerate(
+            tqdm(train_loader, desc=f"Epoch {epoch} train",
+                 initial=resume_skip, total=iters_per_epoch),
+            start=resume_skip):
+        if (save_every > 0 and batch_idx > resume_skip
+                and batch_idx % save_every == 0):
+            _save_mid(epoch, batch_idx)
         t_frac = global_step / max(total_iters - 1, 1)
         temperature = args.T_min + (args.T_max - args.T_min) * t_frac
         prob_temperature = args.prob_T_max + (args.prob_T_min - args.prob_T_max) * t_frac
@@ -584,19 +710,41 @@ for epoch in range(start_epoch, args.num_epochs):
                 epoch_tau_hist[v] += metrics["tau_hist"][v]
 
         if global_rank == 0:
+            gn = float("nan") if grad_norm is None else float(grad_norm)
+            step_acc = metrics["step_acc"]
+            token_acc = (sum(step_acc) / len(step_acc)) if step_acc else 0.0
             log = {
                 "train/total_loss": total_loss.item(),
                 "train/aux_loss": metrics["aux_loss"],
                 "train/eagle_loss": metrics["eagle_loss"],
                 "train/grpo_loss": metrics.get("grpo_loss", 0.0),
                 "train/mean_tau": metrics["mean_tau"],
+                "train/token_acc": token_acc,
                 "train/temperature": temperature,
-                "train/grad_norm": grad_norm if grad_norm is not None else float("nan"),
+                "train/grad_norm": gn,
                 "train/lr": model_engine.get_lr()[0],
             }
             for k in range(args.gamma):
-                if k < len(metrics["step_acc"]):
-                    log[f"train/step{k}_acc"] = metrics["step_acc"][k]
+                if k < len(step_acc):
+                    log[f"train/step{k}_acc"] = step_acc[k]
+            row = {
+                "step": global_step,
+                "epoch": epoch,
+                "loss": total_loss.item(),
+                "aux_loss": metrics["aux_loss"],
+                "analytic_accepted_length": metrics["mean_tau"],
+                "token_acc": token_acc,
+                "step_acc": step_acc,
+                "grad_norm": gn,
+                "lr": log["train/lr"],
+            }
+            _append_jsonl(step_log_path, row)
+            print(f"  step {global_step} epoch {epoch} | "
+                  f"loss={row['loss']:.4f}  "
+                  f"accepted_length={row['analytic_accepted_length']:.4f}  "
+                  f"token_acc={row['token_acc']:.4f}  "
+                  f"grad_norm={row['grad_norm']:.4f}",
+                  flush=True)
             wandb.log(log, step=global_step)
 
     # Epoch summary
@@ -643,9 +791,30 @@ for epoch in range(start_epoch, args.num_epochs):
                 v = sum(vals) / len(vals)
                 eval_log[f"eval/{name}"] = v
                 print(f"  epoch {epoch} | eval {name}: {v:.4f}")
+        eval_token_acc = []
         for k in range(args.gamma):
             if eval_step_acc[k]:
-                eval_log[f"eval/step{k}_acc"] = sum(eval_step_acc[k]) / len(eval_step_acc[k])
+                acc_k = sum(eval_step_acc[k]) / len(eval_step_acc[k])
+                eval_log[f"eval/step{k}_acc"] = acc_k
+                eval_token_acc.append(acc_k)
+        train_loss = (sum(epoch_metrics["aux_loss"]) / len(epoch_metrics["aux_loss"])
+                      if epoch_metrics["aux_loss"] else 0.0)
+        train_len = (sum(epoch_metrics["mean_tau"]) / len(epoch_metrics["mean_tau"])
+                     if epoch_metrics["mean_tau"] else 0.0)
+        epoch_row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_analytic_accepted_length": train_len,
+            "test_loss": eval_log.get("eval/aux_loss", 0.0),
+            "test_analytic_accepted_length": eval_log.get("eval/mean_tau", 0.0),
+            "test_token_acc": (sum(eval_token_acc) / len(eval_token_acc)
+                               if eval_token_acc else 0.0),
+        }
+        print(f"  epoch {epoch} | test loss={epoch_row['test_loss']:.4f}  "
+              f"test_accepted_length={epoch_row['test_analytic_accepted_length']:.4f}  "
+              f"test_token_acc={epoch_row['test_token_acc']:.4f}",
+              flush=True)
+        _append_jsonl(epoch_log_path, epoch_row)
         wandb.log(eval_log, step=global_step)
 
     deepspeed.comm.barrier()
@@ -662,3 +831,14 @@ for epoch in range(start_epoch, args.num_epochs):
             draft_config = AutoConfig.from_pretrained(args.draftpath)
             draft_config.save_pretrained(ckpt_dir)
             print(f"  Saved checkpoint to {ckpt_dir}")
+            eval_job = _submit_epoch_eval(epoch)
+            if eval_job is not None:
+                _append_jsonl(epoch_log_path, {
+                    "epoch": epoch,
+                    "accept_length_eval_job": eval_job,
+                    "draft": ckpt_dir,
+                })
+
+    resume_skip = 0
+    if save_every > 0:
+        _save_mid(epoch + 1, 0)

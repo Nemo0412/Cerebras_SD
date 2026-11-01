@@ -1321,6 +1321,7 @@ def verify_tree_step(
     temperature: float = 0.0,
     verify_mode: str = 'auto',
     target_top_k: int = 0,
+    path_topk: int = 0,
 ) -> Tuple[torch.Tensor, int, float, VerifyState, List[int]]:
     """Incremental tree verification.
 
@@ -1435,6 +1436,14 @@ def verify_tree_step(
             j = parents_cpu[j]
         path.reverse()
         paths.append(path)
+
+    # Keep the paths whose draft-node probabilities multiply to the largest
+    # score. tree.scores is the cumulative log-prob, so the leaf score is the
+    # path product. path_topk=0 keeps every path.
+    if path_topk and path_topk > 0 and tree.scores is not None:
+        scored = [(float(tree.scores[path[-1]]), path) for path in paths]
+        scored.sort(key=lambda item: item[0], reverse=True)
+        paths = [path for _, path in scored[:int(path_topk)]]
 
     eff_verify = verify_mode
     if eff_verify == 'auto':

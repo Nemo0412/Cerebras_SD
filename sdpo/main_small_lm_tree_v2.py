@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -47,6 +48,9 @@ parser.add_argument('--eal_aux_coef', type=float, default=0.1)
 parser.add_argument('--max_len', type=int, default=2048)
 parser.add_argument('--max_train_samples', type=int, default=None)
 parser.add_argument('--num_epochs', type=int, default=6)
+parser.add_argument('--stop_after_epochs', type=int, default=0,
+                    help='Stop after this many epochs; the LR schedule still '
+                         'spans --num_epochs.')
 parser.add_argument('--lr', type=float, default=None)
 parser.add_argument('--gamma', type=int, default=7,
                     help='Only for dataset chunking compat — tree shape uses top_k_per_depth.')
@@ -62,7 +66,7 @@ parser.add_argument('--temperature', type=float, default=1.0,
 parser.add_argument('--eal_mode', type=str, default='budget',
                     choices=['budget', 'path_topk', 'node_marginal', 'soft_topk',
                              'sample_minpq', 'sample_anyk', 'sample_cover', 'wsoft',
-                             'greedy_topk'],
+                             'greedy_topk', 'dense_tree', 'top4_kl_eal'],
                     help='budget: KL minus E[L] on the node-budget tree. '
                          'path_topk: KL minus exact E[L] on the Top-K path union. '
                          'node_marginal: old node-weighted NLL, not used. '
@@ -91,10 +95,27 @@ parser.add_argument('--eal_mode', type=str, default='budget',
                          'greedy_topk: greedy top-k tree. Keep the --path_topk '
                          'paths with the largest product of draft node '
                          'probabilities. Each path is a chain EAL, '
-                         'P_j = q_j(argmax p_j), E[L] = sum_d prod_{j<=d} P_j. '
-                         'Loss is minus the sum of those chain EALs. The logged '
-                         'accept length is the max of them. '
-                         'Eval with --draft-mode argmax --verify-mode greedy.')
+                         'P_j = softmax(z_j / temperature)[argmax p_j], '
+                         'E[L] = sum_d prod_{j<=d} P_j. Path ranking stays at '
+                         'temperature 1. Loss is minus the weighted sum of those '
+                         'chain EALs. --path_eal_weights is in descending '
+                         'draft-probability order; empty weights are all 1. '
+                         'The logged accept length is the unweighted max. '
+                         'Eval with --draft-mode argmax --verify-mode greedy. '
+                         'dense_tree: dense KL(p||q) over the sequence + '
+                         'anchor_kl_coef * KL on the nodes of the --path_topk '
+                         'rollout paths - eal_aux_coef * (teacher-forced tree '
+                         'E[L] - path_eal_var_coef * window variance). Depth j '
+                         'accepts iff the target mode is in the draft top-k_j, '
+                         'scored by sigmoid((z(u) - k_j-th other logit) / '
+                         '--greedy_tau). '
+                         'top4_kl_eal: only the --path_topk rollout paths. '
+                         'anchor_kl_coef * mean KL over the distributions that '
+                         'drafted their nodes - eal_aux_coef * (mean chain EAL '
+                         'of the paths - path_eal_var_coef * their variance). '
+                         'With --dense_eal_start the anchors are drawn only '
+                         'from positions where greedy tree decoding opens a '
+                         'window.')
 parser.add_argument('--greedy_tau', type=float, default=1.0,
                     help='Temperature of the soft top-k score in eal_mode=wsoft.')
 parser.add_argument('--soft_target_m', type=int, default=4,
@@ -113,12 +134,78 @@ parser.add_argument('--n_anchors', type=int, default=1,
 parser.add_argument('--path_topk', type=int, default=16,
                     help='How many paths to keep. Used by path_topk, '
                          'node_marginal, soft_topk, and greedy_topk.')
+parser.add_argument('--path_eal_weights', type=str, default='',
+                    help='Comma-separated greedy_topk weights, best path first. '
+                         'Example: 1,2,3,4 gives the highest draft-probability '
+                         'path weight 1 and the fourth path weight 4. '
+                         'Empty keeps an unweighted sum.')
+parser.add_argument('--path_eal_mean', action='store_true',
+                    help='greedy_topk without weights: average the kept paths\' '
+                         'chain EALs instead of summing them.')
+parser.add_argument('--path_eal_var_coef', type=float, default=0.0,
+                    help='greedy_topk: add this times the variance of the kept '
+                         'paths\' chain EALs to the loss, so all paths improve '
+                         'together. 0 disables it.')
+parser.add_argument('--dense_eal_start', action='store_true',
+                    help='dense_tree: average E[L] only over the windows greedy '
+                         'tree decoding opens with the current draft, instead '
+                         'of a window at every position. top4_kl_eal: draw '
+                         'anchors only from those window starts.')
+parser.add_argument('--eal_start_split', action='store_true',
+                    help='top4_kl_eal with --dense_eal_start: keep n_anchors '
+                         'uniformly drawn trees for the KL and add n_anchors '
+                         'trees at decoding window starts that carry only the EAL.')
+parser.add_argument('--top4path_starts', action='store_true',
+                    help='--dense_eal_start: find window starts with the '
+                         'path_topk-path verification rule instead of the '
+                         'full top_k_per_depth tree.')
+parser.add_argument('--exact_starts', action='store_true',
+                    help='--dense_eal_start: find window starts by running greedy '
+                         'path_topk-path verification with the draft tree at every '
+                         'supervised position.')
+parser.add_argument('--exact_starts_chunk', type=int, default=64,
+                    help='Positions expanded together by --exact_starts.')
+parser.add_argument('--top4_start_eal', action='store_true',
+                    help='dense_tree + --exact_starts: E[L] at every window start is '
+                         'the mean chain EAL of the path_topk paths the verification '
+                         'keeps there.')
+parser.add_argument('--exact_segment_frac', type=float, default=0.0,
+                    help='--exact_starts: expand only a random contiguous segment of '
+                         'this fraction of each sequence (plus --exact_burn positions '
+                         'before it); E[L] is trained inside the segment.')
+parser.add_argument('--exact_random_frac', type=float, default=0.0,
+                    help='--exact_starts --top4_start_eal: train the unweighted top-4 '
+                         'mean-path E[L] on this fraction of supervised positions, '
+                         'drawn uniformly, instead of the window starts.')
+parser.add_argument('--exact_burn', type=int, default=32,
+                    help='Burn-in positions walked before the --exact_segment_frac '
+                         'segment.')
+parser.add_argument('--prob_starts', action='store_true',
+                    help='--top4_start_eal: weight the E[L] of every position by the '
+                         'probability a window starts there (renewal recursion over '
+                         'the greedy tree acceptance surrogate) instead of the exact '
+                         'starts.')
+parser.add_argument('--dense_kl', action='store_true',
+                    help='top4_kl_eal: add the teacher-forced KL(p||q) over every '
+                         'supervised position of the sequence (the chain KL).')
+parser.add_argument('--eal_gradnorm_ratio', type=float, default=0.0,
+                    help='top4_kl_eal: replace eal_aux_coef by a coefficient that '
+                         'makes the EAL gradient this many times as long as the KL '
+                         'gradient (norms measured every --eal_gradnorm_every '
+                         'micro-batches, EMA). 0 disables it.')
+parser.add_argument('--eal_gradnorm_every', type=int, default=10)
+parser.add_argument('--save_every_steps', type=int, default=1000,
+                    help='Save a resumable mid-epoch checkpoint every N micro-batches '
+                         'into savedir/mid. Only the newest one is kept, without the '
+                         'frozen target weights. Rounded up to a multiple of '
+                         'gradient_accumulation_steps. 0 saves only at epoch end.')
 parser.add_argument('--local_rank', type=int, default=-1)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
 top_k_list = [int(x) for x in args.top_k_per_depth.split(',') if x.strip()]
 assert len(top_k_list) >= 1, "top_k_per_depth must be non-empty"
+path_eal_weights = [float(x) for x in args.path_eal_weights.split(',') if x.strip()]
 
 with open(args.deepspeed_config) as f:
     ds_config = json.load(f)
@@ -133,8 +220,9 @@ def find_latest_checkpoint(directory):
         return None, 0
     max_epoch = -1
     for sub in os.listdir(directory):
-        m = re.match(r"state_(\d+)", sub)
-        if m and os.path.isdir(os.path.join(directory, sub)):
+        m = re.match(r"state_(\d+)$", sub)
+        # DeepSpeed writes `latest` last, so a state dir without it is a partial save.
+        if m and os.path.isfile(os.path.join(directory, sub, "latest")):
             max_epoch = max(max_epoch, int(m.group(1)))
     if max_epoch == -1:
         return None, 0
@@ -163,6 +251,9 @@ if args.lr is not None:
 samples_per_gpu = math.ceil(len(traindataset) / n_gpus)
 iters_per_epoch = math.ceil(samples_per_gpu / micro_bs)
 total_iters = iters_per_epoch * args.num_epochs
+save_every = args.save_every_steps
+if save_every > 0:
+    save_every = math.ceil(save_every / grad_accum) * grad_accum
 
 # Print tree shape
 depth_counts = [top_k_list[0]]
@@ -198,6 +289,19 @@ model = SmallLMTreeV2Model(
 )
 model.greedy_tau = args.greedy_tau
 model.soft_target_m = args.soft_target_m
+model.dense_eal_start = args.dense_eal_start
+model.dense_kl = args.dense_kl
+model.eal_start_split = args.eal_start_split
+model.top4path_starts = args.top4path_starts
+model.exact_starts = args.exact_starts
+model.exact_starts_chunk = args.exact_starts_chunk
+model.top4_start_eal = args.top4_start_eal
+model.prob_starts = args.prob_starts
+model.exact_segment_frac = args.exact_segment_frac
+model.exact_burn = args.exact_burn
+model.exact_random_frac = args.exact_random_frac
+model.eal_gn_ratio = args.eal_gradnorm_ratio
+model.eal_gn_every = args.eal_gradnorm_every
 
 args.deepspeed_config = None
 trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -229,9 +333,29 @@ if global_rank == 0:
         "tree_N_nodes": N_nodes, "tree_n_paths": n_paths,
     })
 
+class _SkipSampler(torch.utils.data.Sampler):
+    """DistributedSampler that drops the first `skip_batches` micro-batches."""
+
+    def __init__(self, base, batch_size):
+        self.base = base
+        self.batch_size = batch_size
+        self.skip_batches = 0
+
+    def set_epoch(self, epoch):
+        self.base.set_epoch(epoch)
+
+    def __iter__(self):
+        return iter(list(self.base)[self.skip_batches * self.batch_size:])
+
+    def __len__(self):
+        return max(len(self.base) - self.skip_batches * self.batch_size, 0)
+
+
 os.makedirs(args.savedir, exist_ok=True)
-train_sampler = DistributedSampler(traindataset, num_replicas=world_size,
-                                   rank=global_rank, shuffle=True)
+train_sampler = _SkipSampler(
+    DistributedSampler(traindataset, num_replicas=world_size,
+                       rank=global_rank, shuffle=True),
+    micro_bs)
 test_sampler = DistributedSampler(testdataset, num_replicas=world_size,
                                   rank=global_rank, shuffle=False)
 train_loader = DataLoader(traindataset, batch_size=micro_bs,
@@ -241,14 +365,71 @@ test_loader = DataLoader(testdataset, batch_size=micro_bs,
                          sampler=test_sampler, num_workers=0,
                          pin_memory=True, collate_fn=DataCollator())
 
+mid_dir = os.path.join(args.savedir, "mid")
+mid_meta = os.path.join(mid_dir, "progress.json")
+_SUM_KEYS = ("sum_total", "sum_kl", "sum_eal", "sum_eal_loss", "sum_gn",
+             "sum_anchors", "n_batches")
+
 ckpt_path, start_epoch = find_latest_checkpoint(args.savedir)
-if ckpt_path:
+global_step = start_epoch * iters_per_epoch
+resume_skip = 0
+resume_sums = None
+mid_progress = None
+if os.path.isfile(mid_meta):
+    with open(mid_meta) as f:
+        mid_progress = json.load(f)
+    if mid_progress["epoch"] < start_epoch:
+        mid_progress = None
+if mid_progress is not None:
+    print(f"[SmallLMTreeV2] Resuming mid-epoch from {mid_dir}/{mid_progress['tag']}")
+    model_engine.load_checkpoint(mid_dir, tag=mid_progress["tag"],
+                                 load_module_strict=False)
+    start_epoch = mid_progress["epoch"]
+    resume_skip = mid_progress["batches_done"]
+    global_step = mid_progress["global_step"]
+    resume_sums = mid_progress["sums"]
+elif ckpt_path:
     print(f"[SmallLMTreeV2] Resuming from {ckpt_path}")
-    model_engine.load_checkpoint(ckpt_path)
+    model_engine.load_checkpoint(ckpt_path, load_module_strict=False)
 
 step_log_path = os.path.join(args.savedir, "train_steps.jsonl")
 epoch_log_path = os.path.join(args.savedir, "epoch_metrics.jsonl")
 eval_sbatch = os.environ.get("EVAL_SBATCH", "")
+
+if global_rank == 0 and os.path.isfile(step_log_path):
+    # Steps logged after the checkpoint we resume from are replayed, so drop them.
+    with open(step_log_path) as f:
+        kept = [ln for ln in f
+                if ln.strip() and json.loads(ln).get("step", 0) <= global_step]
+    with open(step_log_path, "w") as f:
+        f.writelines(kept)
+
+
+def _save_mid(epoch, batches_done):
+    tag = f"e{epoch}_b{batches_done}"
+    model_engine.save_checkpoint(mid_dir, tag=tag, exclude_frozen_parameters=True)
+    deepspeed.comm.barrier()
+    if global_rank == 0:
+        prev_tag = None
+        if os.path.isfile(mid_meta):
+            with open(mid_meta) as f:
+                prev_tag = json.load(f).get("tag")
+        g = globals()
+        progress = {
+            "tag": tag,
+            "epoch": epoch,
+            "batches_done": batches_done,
+            "global_step": global_step,
+            "sums": {k: g[k] for k in _SUM_KEYS},
+        }
+        tmp = mid_meta + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(progress, f)
+        os.replace(tmp, mid_meta)
+        if prev_tag and prev_tag != tag:
+            shutil.rmtree(os.path.join(mid_dir, prev_tag), ignore_errors=True)
+        print(f"  [mid-epoch save] {mid_dir}/{tag}  step={global_step}", flush=True)
+    deepspeed.comm.barrier()
 
 
 def _append_jsonl(path, row):
@@ -264,8 +445,8 @@ def _submit_epoch_eval(epoch):
     if not os.path.isfile(eval_sbatch):
         print(f"  epoch {epoch} | eval sbatch missing: {eval_sbatch}")
         return None
-    partition = os.environ.get("SLURM_JOB_PARTITION", "")
-    account = os.environ.get("SLURM_JOB_ACCOUNT", "")
+    partition = os.environ.get("EVAL_PARTITION") or os.environ.get("SLURM_JOB_PARTITION", "")
+    account = os.environ.get("EVAL_ACCOUNT") or os.environ.get("SLURM_JOB_ACCOUNT", "")
     cmd = ["sbatch", "--parsable",
            f"--job-name=eal_ev_e{epoch}",
            f"--export=ALL,EPOCH={epoch}"]
@@ -283,11 +464,12 @@ def _submit_epoch_eval(epoch):
     return out
 
 
-global_step = start_epoch * iters_per_epoch
 for epoch in range(start_epoch, args.num_epochs):
     train_sampler.set_epoch(epoch + 1)
+    train_sampler.skip_batches = resume_skip
     model.train()
-    print(f"[SmallLMTreeV2] Epoch {epoch}")
+    print(f"[SmallLMTreeV2] Epoch {epoch}"
+          + (f" (resuming after batch {resume_skip})" if resume_skip else ""))
 
     sum_total = 0.0
     sum_kl = 0.0
@@ -296,8 +478,17 @@ for epoch in range(start_epoch, args.num_epochs):
     sum_gn = 0.0
     sum_anchors = 0
     n_batches = 0
+    if resume_sums is not None:
+        globals().update(resume_sums)
+        resume_sums = None
 
-    for data in tqdm(train_loader, desc=f"Epoch {epoch} train"):
+    for batch_idx, data in enumerate(
+            tqdm(train_loader, desc=f"Epoch {epoch} train",
+                 initial=resume_skip, total=iters_per_epoch),
+            start=resume_skip):
+        if (save_every > 0 and batch_idx > resume_skip
+                and batch_idx % save_every == 0):
+            _save_mid(epoch, batch_idx)
         model.zero_grad()
         total_loss, _, metrics = model_engine(
             input_ids=data["input_ids"].to(rank),
@@ -308,6 +499,9 @@ for epoch in range(start_epoch, args.num_epochs):
             temperature=args.temperature,
             eal_mode=args.eal_mode,
             path_topk=args.path_topk,
+            path_eal_weights=path_eal_weights,
+            path_eal_mean=args.path_eal_mean,
+            path_eal_var_coef=args.path_eal_var_coef,
             eal_score_coef=args.eal_score_coef,
             n_anchors=args.n_anchors,
             n_draws=args.n_draws,
@@ -344,6 +538,18 @@ for epoch in range(start_epoch, args.num_epochs):
                 "num_anchors": metrics["num_anchors"],
                 "tree_nodes": metrics["tree_nodes"],
             }
+            if "path_eal_std" in metrics:
+                row["path_eal_std"] = metrics["path_eal_std"]
+            for key in ("dense_eal", "dense_var", "dense_hard_al",
+                        "eal_gn_coef", "gnorm_kl", "gnorm_eal", "windows_per_seq",
+                        "exact_al_at_starts", "exact_al_all_pos",
+                        "prob_windows_per_seq", "exact_expanded_frac",
+                        "exact_rounds"):
+                if key in metrics:
+                    row[key] = metrics[key]
+            for key in metrics:
+                if key.startswith("path") and key.endswith(("_eal", "_al", "_var")):
+                    row[key] = metrics[key]
             _append_jsonl(step_log_path, row)
             print(f"  step {global_step} epoch {epoch} | "
                   f"loss={row['loss']:.4f}  eal_loss={row['eal_loss']:.4f}  "
@@ -370,6 +576,8 @@ for epoch in range(start_epoch, args.num_epochs):
               f"grad_norm={sum_gn/n_batches:.4f}  "
               f"kl={sum_kl/n_batches:.4f}  "
               f"avg_anchors={sum_anchors/n_batches:.1f}")
+    resume_skip = 0
+    train_sampler.skip_batches = 0
 
     model.eval()
     e_total, e_kl, e_eal, e_eal_loss, e_n = 0.0, 0.0, 0.0, 0.0, 0
@@ -384,6 +592,9 @@ for epoch in range(start_epoch, args.num_epochs):
                 temperature=args.temperature,
                 eal_mode=args.eal_mode,
                 path_topk=args.path_topk,
+                path_eal_weights=path_eal_weights,
+                path_eal_mean=args.path_eal_mean,
+                path_eal_var_coef=args.path_eal_var_coef,
                 eal_score_coef=args.eal_score_coef,
                 n_anchors=args.n_anchors,
                 n_draws=args.n_draws,
@@ -428,14 +639,19 @@ for epoch in range(start_epoch, args.num_epochs):
     deepspeed.comm.barrier()
     torch.cuda.empty_cache()
 
+    # The frozen 8B target is ~30GB per save; only the draft and optimizer
+    # are needed to resume, and only the newest epoch state is kept.
     ckpt_dir = f"{args.savedir}/state_{epoch}"
-    model_engine.save_checkpoint(ckpt_dir)
+    model_engine.save_checkpoint(ckpt_dir, exclude_frozen_parameters=True)
     if global_rank == 0:
         hf_dir = f"{args.savedir}/hf_epoch_{epoch}"
         model_engine.module.draft_model.save_pretrained(hf_dir)
         tokenizer.save_pretrained(hf_dir)
         print(f"  Saved DeepSpeed checkpoint to {ckpt_dir}")
         print(f"  Saved HF draft to {hf_dir}")
+        shutil.rmtree(mid_dir, ignore_errors=True)
+        for old in range(epoch):
+            shutil.rmtree(f"{args.savedir}/state_{old}", ignore_errors=True)
         eval_job = _submit_epoch_eval(epoch)
         if eval_job is not None:
             _append_jsonl(epoch_log_path, {
@@ -444,3 +660,6 @@ for epoch in range(start_epoch, args.num_epochs):
                 "draft": hf_dir,
             })
     deepspeed.comm.barrier()
+    if args.stop_after_epochs and epoch + 1 >= args.stop_after_epochs:
+        print(f"[SmallLMTreeV2] Stopping after epoch {epoch} (--stop_after_epochs)")
+        break

@@ -108,6 +108,30 @@ def _load_gemma4_as_causal(name: str, dtype):
         cache_dir, dtype=dtype, attn_implementation="sdpa")
 
 
+@torch.no_grad()
+def _greedy_window_starts(draft_lg, target_argmax, mask, win_mask, gamma):
+    """Window starts greedy chain decoding actually opens, from the current
+    draft's hard accepts: the first is the first response position, and a
+    window at s that accepts n tokens (n <= gamma) is followed by one at
+    s + n + 1 (the target's correction or bonus token)."""
+    hit_c = ((draft_lg.argmax(dim=-1) == target_argmax) & mask).cpu().numpy()
+    mask_c = win_mask.cpu().numpy()
+    start = torch.zeros_like(win_mask)
+    for b in range(hit_c.shape[0]):
+        valid = mask_c[b].nonzero()[0]
+        if valid.size == 0:
+            continue
+        s, end = int(valid[0]), int(valid[-1]) + 1
+        while s < end:
+            if mask_c[b, s]:
+                start[b, s] = True
+            n = 0
+            while n < gamma and hit_c[b, s + n]:
+                n += 1
+            s += n + 1
+    return start
+
+
 def _get_step_weights(scheme, n, device, dtype):
     """Per-step weights of length n for loss aggregation.
 
@@ -217,7 +241,11 @@ class SmallLMDraftModel(nn.Module):
             f"anchor must be kl|ce|eal|none, got {anchor}"
         assert aux_loss in ('none', 'v2', 'v4', 'v4_w1', 'v4eal', 'v5', 'v6', 'v7', 'v8',
                             'tv', 'eal', 'eal_w1', 'peal',
-                            'al_tv', 'al_tree', 'al_cover', 'al_greedy', 'al_greedy_tree',
+                            'al_tv', 'al_tree', 'al_cover', 'al_greedy', 'al_greedy_wce',
+                            'al_greedy_wce_start', 'al_greedy_margin',
+                            'al_greedy_wkl', 'al_greedy_wkl_start',
+                            'al_greedy_tree', 'al_greedy_tree_v4',
+                            'al_tree_greedy',
                             'al_kl', 'wkl',
                             'al_tv_intersect_topk', 'al_tv_target_topk',
                             'al_tv_target_topp',
@@ -603,17 +631,113 @@ class SmallLMDraftModel(nn.Module):
             #   E[L] = Σ_d Π_{j≤d} b_{t+j}
             # 'eal' is the same expression.
             # Expected Accept Length:
-            #   P_t = softmax(draft_logit_t)[target_argmax_t]    ∈ [0, 1]
+            #   P_t = softmax(draft_logit_t / T)[target_argmax_t]    ∈ [0, 1]
+            #   T is prob_temperature. T < 1 pulls P toward the greedy 0/1 decision.
             #   E[τ] = Σ_{k=1..γ-1} k · cum[k-1]·(1-P[k]) + γ · cum[γ-1]
             #        = Σ_{k=0..γ-1} cum_prod[k]                  (algebraic identity)
             # We weight each cum_prod term by aux_weight scheme (uniform = exact EAL).
-            draft_q = F.softmax(draft_lg, dim=-1)
+            T_p = max(float(prob_temperature), 1e-6)
+            draft_q = F.softmax(draft_lg / T_p, dim=-1)
             P = draft_q.gather(
                 -1, target_argmax.unsqueeze(-1)).squeeze(-1)         # [B, L-1]
             P_stack = torch.stack(
                 [P[:, k:k + usable] for k in range(gamma)], dim=-1)
             cum_prod = torch.cumprod(P_stack, dim=-1)                # [B, U, γ]
             eal = (cum_prod * weights).sum(dim=-1)                   # [B, U]
+            aux = -(eal * win_mask.float()).sum() / (nv_win + 1e-8)
+
+        elif aux_loss == 'al_greedy_wce':
+            # d E[L] / d z_t = w_t * P_t * ∇ log P_t with w_t = d E[L] / d P_t.
+            # The P_t factor kills the gradient wherever the draft is wrong.
+            # Drop it: loss = -Σ_t w_t log q_t(u_t), w_t detached, so a wrong
+            # position gets w_t * (q_t - e_u) while keeping al_greedy's weight
+            # (reach probability of t times the value of accepting it).
+            T_p = max(float(prob_temperature), 1e-6)
+            with torch.enable_grad():
+                z_d = draft_lg.detach() / T_p
+                P_d = torch.exp(
+                    z_d.gather(-1, target_argmax.unsqueeze(-1)).squeeze(-1)
+                    - torch.logsumexp(z_d, dim=-1)).requires_grad_(True)
+                del z_d
+                P_stack = torch.stack(
+                    [P_d[:, k:k + usable] for k in range(gamma)], dim=-1)
+                eal_d = (torch.cumprod(P_stack, dim=-1) * weights).sum(dim=-1)
+                w = torch.autograd.grad(
+                    (eal_d * win_mask.float()).sum(), P_d)[0]        # [B, L-1]
+            log_q = draft_logp.gather(
+                -1, target_argmax.unsqueeze(-1)).squeeze(-1)         # [B, L-1]
+            aux = -(w * log_q).sum() / (nv_win + 1e-8)
+
+        elif aux_loss == 'al_greedy_wce_start':
+            # al_greedy_wce restricted to the windows greedy decoding actually
+            # opens. With the current draft's hard accepts a_t, the first window
+            # starts at the first response position; a window at s that accepts
+            # n tokens (n <= gamma) is followed by one at s + n + 1 (the target's
+            # correction or bonus token). Only those starts count in E[L].
+            T_p = max(float(prob_temperature), 1e-6)
+            start = _greedy_window_starts(
+                draft_lg, target_argmax, mask, win_mask, gamma)
+            with torch.enable_grad():
+                z_d = draft_lg.detach() / T_p
+                P_d = torch.exp(
+                    z_d.gather(-1, target_argmax.unsqueeze(-1)).squeeze(-1)
+                    - torch.logsumexp(z_d, dim=-1)).requires_grad_(True)
+                del z_d
+                P_stack = torch.stack(
+                    [P_d[:, k:k + usable] for k in range(gamma)], dim=-1)
+                eal_d = (torch.cumprod(P_stack, dim=-1) * weights).sum(dim=-1)
+                w = torch.autograd.grad(
+                    (eal_d * start.float()).sum(), P_d)[0]           # [B, L-1]
+            log_q = draft_logp.gather(
+                -1, target_argmax.unsqueeze(-1)).squeeze(-1)         # [B, L-1]
+            aux = -(w * log_q).sum() / (start.float().sum() + 1e-8)
+
+        elif aux_loss in ('al_greedy_wkl', 'al_greedy_wkl_start'):
+            # Same detached weight as al_greedy_wce(_start), w_t = d E[L] / d P_t
+            # (reach probability of t times the value of accepting it), but it
+            # scales the full per-position KL instead of the hard-label CE, so
+            # every position keeps the target's soft distribution:
+            #   loss = Σ_t ŵ_t · CE(p_t, q_t),  ŵ = w / mean_valid(w)
+            # Normalizing to mean 1 keeps the loss on the scale of plain KL.
+            T_p = max(float(prob_temperature), 1e-6)
+            if aux_loss == 'al_greedy_wkl_start':
+                win_w = _greedy_window_starts(
+                    draft_lg, target_argmax, mask, win_mask, gamma).float()
+            else:
+                win_w = win_mask.float()
+            with torch.enable_grad():
+                z_d = draft_lg.detach() / T_p
+                P_d = torch.exp(
+                    z_d.gather(-1, target_argmax.unsqueeze(-1)).squeeze(-1)
+                    - torch.logsumexp(z_d, dim=-1)).requires_grad_(True)
+                del z_d
+                P_stack = torch.stack(
+                    [P_d[:, k:k + usable] for k in range(gamma)], dim=-1)
+                eal_d = (torch.cumprod(P_stack, dim=-1) * weights).sum(dim=-1)
+                w = torch.autograd.grad((eal_d * win_w).sum(), P_d)[0]
+            mf = mask.float()
+            w = w * mf
+            w = w / (w.sum() / (nv + 1e-8) + 1e-8)
+            ce_soft = -torch.sum(target_p * draft_logp, dim=-1)        # [B, L-1]
+            aux = (w * ce_soft).sum() / (nv + 1e-8)
+
+        elif aux_loss == 'al_greedy_margin':
+            # Greedy verify accepts iff u_t = argmax p_t is the draft's top-1.
+            # Score that decision by its logit margin instead of q_t(u_t),
+            # which competes with the whole vocabulary and vanishes when wrong:
+            #   m_t = z_t[u_t] - max_{v != u_t} z_t[v]
+            #   a_t = sigmoid(m_t / tau),  tau = prob_temperature
+            #   E[L] = Σ_d Π_{j≤d} a_{t+j}  over every γ-window
+            # The gradient moves only z[u_t] up and the strongest rival down.
+            tau = max(float(prob_temperature), 1e-6)
+            z_u = draft_lg.gather(-1, target_argmax.unsqueeze(-1)).squeeze(-1)
+            top2_v, top2_i = draft_lg.topk(2, dim=-1)                # [B, L-1, 2]
+            rival = torch.where(top2_i[..., 0] == target_argmax,
+                                top2_v[..., 1], top2_v[..., 0])
+            a = torch.sigmoid((z_u.float() - rival.float()) / tau)  # [B, L-1]
+            a_stack = torch.stack(
+                [a[:, k:k + usable] for k in range(gamma)], dim=-1)
+            eal = (torch.cumprod(a_stack, dim=-1) * weights).sum(dim=-1)
             aux = -(eal * win_mask.float()).sum() / (nv_win + 1e-8)
 
         elif aux_loss == 'v4_w1':
@@ -755,6 +879,32 @@ class SmallLMDraftModel(nn.Module):
             acc_length = (cum_prod * weights).sum(dim=-1)
             aux = -(acc_length * win_mask.float()).sum() / (nv_win + 1e-8)
 
+        elif aux_loss == 'al_greedy_tree_v4':
+            # v4 with the tree acceptance test: c_d = min(1, 2σ((z_q(u) -
+            # z_(k_d)) / τ)), z_(k) the k-th largest logit among tokens other
+            # than u. Once u is inside the top-k_d the factor is exactly 1 and
+            # has no gradient, so only slots u just misses are pushed. k_d = 1
+            # is v4.
+            topk_list = list(getattr(self, 'altree_topk', [1] * gamma))
+            if len(topk_list) < gamma:
+                topk_list = topk_list + [topk_list[-1]] * (gamma - len(topk_list))
+            k_max = max(max(int(k) for k in topk_list[:gamma]), 1)
+            tau = float(getattr(self, 'greedy_tau', 1.0))
+            lg = draft_lg.float()
+            u = target_argmax
+            kth = lg.scatter(
+                -1, u.unsqueeze(-1), torch.finfo(lg.dtype).min).topk(k_max, dim=-1).values
+            z_u = lg.gather(-1, u.unsqueeze(-1)).squeeze(-1)
+            cols = []
+            for d in range(gamma):
+                k = max(int(topk_list[d]), 1)
+                gap = (z_u[:, d:d + usable] - kth[:, d:d + usable, k - 1]) / tau
+                cols.append((2.0 * torch.sigmoid(gap)).clamp(max=1.0))
+            cum_prod = torch.cumprod(torch.stack(cols, dim=-1), dim=-1)
+            acc_length = (cum_prod * weights).sum(dim=-1)
+            aux = -(acc_length * win_mask.float()).sum() / (nv_win + 1e-8)
+            del kth
+
         elif aux_loss == 'al_greedy_tree':
             # Tree greedy surrogate. A slot of width k accepts when the target
             # mode u sits in the draft's top-k. The hard membership test has
@@ -784,6 +934,34 @@ class SmallLMDraftModel(nn.Module):
             acc_length = (cum_prod * weights).sum(dim=-1)
             aux = -(acc_length * win_mask.float()).sum() / (nv_win + 1e-8)
             del masked, kth
+
+        elif aux_loss == 'al_tree_greedy':
+            # Tree greedy loss. u_j is the target mode. The threshold is the
+            # mean of the top-k_j draft logits among tokens other than u_j:
+            #   c_j = σ((z_j(u_j) - mean(top-k_j other logits)) / τ)
+            #   L = -Σ_d Π_{j≤d} c_j
+            # aux_weight=uniform is that sum. k_j comes from altree_topk.
+            topk_list = list(getattr(self, 'altree_topk', [1] * gamma))
+            if len(topk_list) < gamma:
+                topk_list = topk_list + [topk_list[-1]] * (gamma - len(topk_list))
+            k_max = max(max(int(k) for k in topk_list[:gamma]), 1)
+            tau = float(getattr(self, 'greedy_tau', 1.0))
+            lg = draft_lg.float()
+            u = target_argmax
+            masked = lg.scatter(
+                -1, u.unsqueeze(-1), torch.finfo(lg.dtype).min)
+            topk_other = masked.topk(k_max, dim=-1).values
+            z_u = lg.gather(-1, u.unsqueeze(-1)).squeeze(-1)
+            cols = []
+            for d in range(gamma):
+                k = max(int(topk_list[d]), 1)
+                thr = topk_other[:, d:d + usable, :k].mean(dim=-1)
+                cols.append(torch.sigmoid((z_u[:, d:d + usable] - thr) / tau))
+            c_stack = torch.stack(cols, dim=-1)
+            cum_prod = torch.cumprod(c_stack, dim=-1)
+            acc_length = (cum_prod * weights).sum(dim=-1)
+            aux = -(acc_length * win_mask.float()).sum() / (nv_win + 1e-8)
+            del masked, topk_other
 
         elif aux_loss == 'al_tv_intersect_topk':
             # Variant 1: draft keeps only intersect(topK_draft, topK_target), zeros elsewhere.

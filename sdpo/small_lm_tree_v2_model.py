@@ -653,6 +653,34 @@ def _tree_window_starts(hit, mask, gamma):
     return start.to(mask.device)
 
 
+def _fill_walk_round(todo, heads, known, n_c, n_appr, budget, conf):
+    """Fill a round of the exact walk (the set of (b, t) to expand) up to `budget` positions
+    with the positions most likely to be on the walk: best-first over the walk's branch tree
+    from every walk head (b, s, end). A position scores the log-probability of its most likely
+    path; an unexpanded t moves to t + n' + 1 with P(n' | n_appr[t]) from the counts conf
+    [n_appr, n], an expanded t to t + n_c[t] + 1."""
+    import heapq
+    import numpy as np
+    K = conf.shape[0]
+    logp = np.log(conf / conf.sum(1, keepdims=True))
+    pq = [(0.0, b, s, end) for b, s, end in heads]
+    heapq.heapify(pq)
+    seen = set()
+    while pq and len(todo) < budget:
+        c, b, t, end = heapq.heappop(pq)
+        if t >= end or (b, t) in seen:
+            continue
+        seen.add((b, t))
+        if known[b, t]:
+            heapq.heappush(pq, (c, b, t + int(n_c[b, t]) + 1, end))
+            continue
+        todo.add((b, t))
+        na = min(int(n_appr[b, t]), K - 1)
+        for nt in range(K):
+            heapq.heappush(pq, (c - logp[na, nt], b, t + nt + 1, end))
+    return todo
+
+
 @torch.no_grad()
 def _top4path_accept(rank, lp, mask, top_k, path_topk):
     """[B, L] teacher-forced accept length when verification keeps only the
@@ -1646,6 +1674,25 @@ class SmallLMTreeV2Model(nn.Module):
         }
 
     @torch.no_grad()
+    def _exact_batching(self):
+        """exact_batching: "continuous" fills every walk round of _exact_window_starts up
+        to a multiple of the chunk (fill=True), "per_round" expands only what the round
+        needs."""
+        mode = getattr(self, "exact_batching", "continuous")
+        assert mode in ("per_round", "continuous"), mode
+        return mode
+
+    def _expansion_scope(self):
+        """exact_attn_backend: with "flashinfer" (default) the tree expansions of
+        _exact_window_starts calls inside the block run on flashinfer paged attention
+        (tree_expand_fi); "naive" keeps the per-start prefix copies and SDPA."""
+        backend = getattr(self, "exact_attn_backend", "flashinfer")
+        assert backend in ("naive", "flashinfer"), backend
+        if backend == "naive":
+            return contextlib.nullcontext()
+        import tree_expand_fi
+        return tree_expand_fi.scope(self)
+
     def _expand_positions(self, rows, cols, drf_hidden, drf_keys, drf_values, u,
                           mask, path_topk, chunk, n, n_path, path_margin):
         """Expand the draft tree at (rows[i], cols[i]) and write the greedy
@@ -1660,6 +1707,12 @@ class SmallLMTreeV2Model(nn.Module):
         cols_t = torch.as_tensor(cols, device=dev, dtype=torch.long)
         fast = bool(getattr(self, "fast_expand", True))
         n_tree = sum(math.prod(top_k[:d + 1]) for d in range(gamma - 1))
+        ex = getattr(self, "_tree_expander", None)
+        if ex is not None:
+            ex.expand_chunks(self, rows, cols, rows_t, cols_t, drf_hidden, drf_keys,
+                             drf_values, u, mask, path_topk, chunk, n, n_path,
+                             path_margin, n_tree, offs, Lm)
+            return
         with (_fold_gqa_attention() if fast else contextlib.nullcontext()):
             self._expand_chunks(rows, cols, rows_t, cols_t, drf_hidden, drf_keys,
                                 drf_values, u, mask, path_topk, chunk, n, n_path,
@@ -1698,36 +1751,45 @@ class SmallLMTreeV2Model(nn.Module):
                 if d < gamma - 1:
                     cache = out.past_key_values
                 del out
-            nodes = torch.cat(toks, dim=1)
-            k_paths = min(int(path_topk), sc.size(1))
-            chosen = self.paths[sc.topk(k_paths, dim=-1).indices]      # [C, k, gamma]
-            path_tok = nodes.gather(1, chosen.reshape(C, -1)).view(C, k_paths, gamma)
-            p = a_t.view(-1, 1) + offs.view(1, -1)
-            inside = p < Lm
-            p = p.clamp(max=Lm - 1)
-            bb = b_t.view(-1, 1).expand_as(p)
-            gold = u[bb, p]
-            valid = inside & mask[bb, p]
-            match = (path_tok == gold.unsqueeze(1)) & valid.unsqueeze(1)
-            m_k = match.long().cumprod(-1).sum(-1)                   # [C, k]
-            n_path[b_t, a_t, :k_paths] = m_k
-            all_tok = nodes[:, self.paths.reshape(-1)].view(C, -1, gamma)
-            m_all = ((all_tok == gold.unsqueeze(1)) & valid.unsqueeze(1)
-                     ).long().cumprod(-1).sum(-1)                    # [C, P]
-            ext = m_all.unsqueeze(-1) > offs.view(1, 1, -1)          # [C, P, gamma]
-            sc3 = sc.unsqueeze(-1).expand_as(ext)
-            best = sc3.masked_fill(~ext, float("-inf")).max(1).values
-            rest = sc3.masked_fill(ext, float("-inf"))
-            thr = rest.topk(k_paths, dim=1).values[:, -1]
-            path_margin[b_t, a_t] = torch.where(
-                ext.any(1), best - thr, torch.full_like(best, float("nan")))
-            n[b_t, a_t] = m_k.max(-1).values.float()
+            self._score_chunk_paths(torch.cat(toks, dim=1), sc, b_t, a_t, u, mask, offs,
+                                    Lm, path_topk, n, n_path, path_margin)
             del cache
+
+    def _score_chunk_paths(self, nodes, sc, b_t, a_t, u, mask, offs, Lm, path_topk, n,
+                           n_path, path_margin):
+        """Write n, n_path and path_margin at the chunk's starts (b_t, a_t) from their expanded
+        trees: nodes [C, n_nodes] tokens, sc [C, n_paths] path log-probs."""
+        gamma = self.gamma
+        C = nodes.size(0)
+        k_paths = min(int(path_topk), sc.size(1))
+        chosen = self.paths[sc.topk(k_paths, dim=-1).indices]          # [C, k, gamma]
+        path_tok = nodes.gather(1, chosen.reshape(C, -1)).view(C, k_paths, gamma)
+        p = a_t.view(-1, 1) + offs.view(1, -1)
+        inside = p < Lm
+        p = p.clamp(max=Lm - 1)
+        bb = b_t.view(-1, 1).expand_as(p)
+        gold = u[bb, p]
+        valid = inside & mask[bb, p]
+        match = (path_tok == gold.unsqueeze(1)) & valid.unsqueeze(1)
+        m_k = match.long().cumprod(-1).sum(-1)                       # [C, k]
+        n_path[b_t, a_t, :k_paths] = m_k
+        all_tok = nodes[:, self.paths.reshape(-1)].view(C, -1, gamma)
+        m_all = ((all_tok == gold.unsqueeze(1)) & valid.unsqueeze(1)
+                 ).long().cumprod(-1).sum(-1)                        # [C, P]
+        ext = m_all.unsqueeze(-1) > offs.view(1, 1, -1)              # [C, P, gamma]
+        sc3 = sc.unsqueeze(-1).expand_as(ext)
+        best = sc3.masked_fill(~ext, float("-inf")).max(1).values
+        rest = sc3.masked_fill(ext, float("-inf"))
+        thr = rest.topk(k_paths, dim=1).values[:, -1]
+        path_margin[b_t, a_t] = torch.where(
+            ext.any(1), best - thr, torch.full_like(best, float("nan")))
+        n[b_t, a_t] = m_k.max(-1).values.float()
 
     @torch.no_grad()
     def _exact_window_starts(self, drf_hidden, drf_keys, drf_values, tgt_hidden,
                              loss_mask, path_topk, chunk=64, all_positions=True,
-                             segment_frac=0.0, burn=32, random_frac=0.0):
+                             segment_frac=0.0, burn=32, random_frac=0.0,
+                             fill=False):
         """[B, L-1] bool: window starts of greedy top-`path_topk`-path decoding,
         found by running the verification: the draft expands its full tree,
         the path_topk paths with the highest draft probability product are
@@ -1753,7 +1815,11 @@ class SmallLMTreeV2Model(nn.Module):
         the expanded region are kept in _exact_segment and _exact_known.
         random_frac > 0 expands that fraction of each sequence's supervised
         positions, drawn uniformly, and returns them in place of the starts
-        (unweighted E[L] at random positions)."""
+        (unweighted E[L] at random positions).
+        fill (walk only) fills every round up to a multiple of `chunk` positions with the
+        positions most likely to be on the walk (_fill_walk_round), with P(n | n_appr)
+        counted over the positions expanded so far: far fewer, full rounds. The starts
+        are the same."""
         import numpy as np
         mask = loss_mask[:, 1:].bool()
         B, Lm = mask.shape
@@ -1834,15 +1900,17 @@ class SmallLMTreeV2Model(nn.Module):
             n_c = np.zeros((B, Lm), dtype=np.int64)
             span = [(int(v[0]), int(v[-1]) + 1) if v.size else (0, 0)
                     for v in (mask_c[b].nonzero()[0] for b in range(B))]
+            conf = np.full((gamma + 2, gamma + 2), 0.1) + np.eye(gamma + 2)
             first = True
             while True:
-                todo = set()
+                todo, walk_heads = set(), []
                 for b in range(B):
                     s, end = span[b]
                     while s < end and known[b, s]:
                         s += int(n_c[b, s]) + 1
                     if s >= end:
                         continue
+                    walk_heads.append((b, s, end))
                     heads = [s] if first else [s] + [s + ell + 1 for ell in range(gamma + 1)]
                     for h, t in enumerate(heads):
                         steps = 0
@@ -1853,10 +1921,16 @@ class SmallLMTreeV2Model(nn.Module):
                 first = False
                 if not todo:
                     break
+                if fill:
+                    _fill_walk_round(todo, walk_heads, known, n_c, n_appr,
+                                     -(-len(todo) // chunk) * chunk, conf)
                 rows, cols = map(list, zip(*sorted(todo)))
                 self._expand_positions(rows, cols, *args)
                 known[rows, cols] = True
                 n_c[rows, cols] = n[rows, cols].long().cpu().numpy()
+                if fill:
+                    np.add.at(conf, (np.minimum(n_appr[rows, cols], gamma + 1),
+                                     np.minimum(n_c[rows, cols], gamma + 1)), 1)
                 self._exact_rounds += 1
             self._exact_rounds -= 1
             self._exact_known = torch.from_numpy(known & mask_c).to(dev)
@@ -1951,11 +2025,13 @@ class SmallLMTreeV2Model(nn.Module):
         if start_anchors:
             # Anchors only where greedy tree decoding opens a window.
             if getattr(self, "exact_starts", False):
-                starts, _ = self._exact_window_starts(
-                    drf_hidden.detach(), drf_keys, drf_values, tgt_hidden,
-                    loss_mask, path_topk,
-                    chunk=int(getattr(self, "exact_starts_chunk", 64)),
-                    all_positions=False)
+                with self._expansion_scope():
+                    starts, _ = self._exact_window_starts(
+                        drf_hidden.detach(), drf_keys, drf_values, tgt_hidden,
+                        loss_mask, path_topk,
+                        chunk=int(getattr(self, "exact_starts_chunk", 64)),
+                        all_positions=False,
+                        fill=self._exact_batching() == "continuous")
             else:
                 starts = decode_window_starts(
                     drf_hidden.detach(), tgt_hidden, self.draft_model.lm_head,
@@ -2005,14 +2081,16 @@ class SmallLMTreeV2Model(nn.Module):
         if eal_mode == "dense_tree":
             exact = None
             if getattr(self, "exact_starts", False):
-                exact, exact_n = self._exact_window_starts(
-                    drf_hidden.detach(), drf_keys, drf_values, tgt_hidden,
-                    loss_mask, path_topk,
-                    chunk=int(getattr(self, "exact_starts_chunk", 64)),
-                    all_positions=bool(getattr(self, "prob_starts", False)),
-                    segment_frac=float(getattr(self, "exact_segment_frac", 0.0)),
-                    burn=int(getattr(self, "exact_burn", 32)),
-                    random_frac=float(getattr(self, "exact_random_frac", 0.0)))
+                with self._expansion_scope():
+                    exact, exact_n = self._exact_window_starts(
+                        drf_hidden.detach(), drf_keys, drf_values, tgt_hidden,
+                        loss_mask, path_topk,
+                        chunk=int(getattr(self, "exact_starts_chunk", 64)),
+                        all_positions=bool(getattr(self, "prob_starts", False)),
+                        segment_frac=float(getattr(self, "exact_segment_frac", 0.0)),
+                        burn=int(getattr(self, "exact_burn", 32)),
+                        random_frac=float(getattr(self, "exact_random_frac", 0.0)),
+                        fill=self._exact_batching() == "continuous")
                 exact_mask = self._exact_known
                 exact_stats = torch.stack([
                     exact.float().sum() / B,

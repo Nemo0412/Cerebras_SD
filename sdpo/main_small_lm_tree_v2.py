@@ -165,6 +165,16 @@ parser.add_argument('--exact_starts', action='store_true',
                          'supervised position.')
 parser.add_argument('--exact_starts_chunk', type=int, default=64,
                     help='Positions expanded together by --exact_starts.')
+parser.add_argument('--exact_attn_backend', choices=['naive', 'flashinfer'], default='flashinfer',
+                    help='--exact_starts tree expansion. flashinfer: paged attention on one '
+                         'shared prefix layout per step (sdpo/tree_expand_fi.py), peak memory '
+                         'flat in --exact_starts_chunk. naive: per-start padded prefix copies '
+                         'and SDPA.')
+parser.add_argument('--exact_batching', choices=['per_round', 'continuous'], default='continuous',
+                    help='--exact_starts walk. continuous: fill every expansion round up to a '
+                         'multiple of --exact_starts_chunk with the positions most likely to be '
+                         'on the walk, so far fewer rounds are needed. per_round: expand only '
+                         'what each round needs. Same starts.')
 parser.add_argument('--top4_start_eal', action='store_true',
                     help='dense_tree + --exact_starts: E[L] at every window start is '
                          'the mean chain EAL of the path_topk paths the verification '
@@ -295,6 +305,8 @@ model.eal_start_split = args.eal_start_split
 model.top4path_starts = args.top4path_starts
 model.exact_starts = args.exact_starts
 model.exact_starts_chunk = args.exact_starts_chunk
+model.exact_attn_backend = args.exact_attn_backend
+model.exact_batching = args.exact_batching
 model.top4_start_eal = args.top4_start_eal
 model.prob_starts = args.prob_starts
 model.exact_segment_frac = args.exact_segment_frac

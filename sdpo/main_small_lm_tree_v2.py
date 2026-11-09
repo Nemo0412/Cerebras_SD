@@ -175,6 +175,11 @@ parser.add_argument('--exact_batching', choices=['per_round', 'continuous'], def
                          'multiple of --exact_starts_chunk with the positions most likely to be '
                          'on the walk, so far fewer rounds are needed. per_round: expand only '
                          'what each round needs. Same starts.')
+parser.add_argument('--exact_vocab_topk', choices=['fused', 'torch'], default='fused',
+                    help='--exact_attn_backend flashinfer: top-k of the draft log-probs at each '
+                         'tree depth. fused: one Triton pass over the bf16 logits '
+                         '(sdpo/vocab_topk.py). torch: fp32 log_softmax, then topk. Same scores '
+                         'up to fp32 rounding; fused breaks ties towards the lower token id.')
 parser.add_argument('--top4_start_eal', action='store_true',
                     help='dense_tree + --exact_starts: E[L] at every window start is '
                          'the mean chain EAL of the path_topk paths the verification '
@@ -307,6 +312,7 @@ model.exact_starts = args.exact_starts
 model.exact_starts_chunk = args.exact_starts_chunk
 model.exact_attn_backend = args.exact_attn_backend
 model.exact_batching = args.exact_batching
+model.exact_vocab_topk = args.exact_vocab_topk
 model.top4_start_eal = args.top4_start_eal
 model.prob_starts = args.prob_starts
 model.exact_segment_frac = args.exact_segment_frac

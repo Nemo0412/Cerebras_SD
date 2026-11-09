@@ -8,6 +8,10 @@ list is its sequence's tokens [0, col_i] followed by its own n_tree tree slots, 
 ancestor mask is the custom_mask of flashinfer's BatchPrefillWithPagedKVCacheWrapper, so nothing
 is copied or padded per start and peak memory does not grow with the chunk size.
 
+model.exact_vocab_topk (--exact_vocab_topk) picks the per-depth top-k of the draft's log-probs:
+"torch" is F.log_softmax(logits.float(), -1).topk(k); "fused" (default) reads the bf16 logits once
+(vocab_topk.lse_topk), same scores up to the fp32 summation order, ties to the lower token id.
+
 Needs flashinfer; without nvcc its kernels come from the matching flashinfer-jit-cache wheel.
 """
 import contextlib
@@ -18,7 +22,18 @@ import flashinfer
 from transformers.cache_utils import DynamicCache, DynamicLayer
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+import vocab_topk
+
 _WRAPPERS = {}
+
+
+def _topk_logprobs(model, logits, k):
+    """(scores, tokens) of F.log_softmax(logits.float(), -1).topk(k), see exact_vocab_topk."""
+    mode = getattr(model, "exact_vocab_topk", "fused")
+    if mode == "fused":
+        return vocab_topk.lse_topk(logits, k)
+    assert mode == "torch", mode
+    return F.log_softmax(logits.float(), -1).topk(k, dim=-1)
 
 
 def _wrapper(dev):
@@ -136,8 +151,8 @@ class TreeExpander:
                 self.base = B * L + torch.arange(C, device=dev) * n_tree
                 cache = DynamicCache()
                 cache.layers = [_TreeLayer(self, li, max_kv) for li in range(len(drf_keys))]
-                lp = F.log_softmax(model.draft_model.lm_head(drf_hidden[b_t, a_t]).float(), -1)
-                sc, tok = lp.topk(top_k[0], dim=-1)
+                sc, tok = _topk_logprobs(model, model.draft_model.lm_head(drf_hidden[b_t, a_t]),
+                                         top_k[0])
                 toks = [tok]
                 n_prev = 0
                 for d in range(1, gamma):
@@ -150,7 +165,7 @@ class TreeExpander:
                             d, kv_lens, max_kv, dev, model.draft_model.dtype),
                         position_ids=(a_t + d).view(C, 1).expand(C, n_in),
                         past_key_values=cache, use_cache=(d < gamma - 1), return_dict=True)
-                    csc, ctok = F.log_softmax(out.logits.float(), -1).topk(top_k[d], dim=-1)
+                    csc, ctok = _topk_logprobs(model, out.logits, top_k[d])
                     sc = (sc.unsqueeze(-1) + csc).reshape(C, -1)
                     toks.append(ctok.reshape(C, -1))
                     n_prev += n_in

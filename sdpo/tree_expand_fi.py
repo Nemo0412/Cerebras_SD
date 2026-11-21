@@ -22,7 +22,10 @@ import flashinfer
 from transformers.cache_utils import DynamicCache, DynamicLayer
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-import vocab_topk
+try:
+    import vocab_topk
+except ImportError:
+    from sdpo import vocab_topk
 
 _WRAPPERS = {}
 

@@ -117,11 +117,15 @@ def spec_decode_tree_smalllm(
 
     while total_tokens < max_new_tokens:
         pre_len = draft_state.cache_len        # before this round's tree build
-        need_probs = verify_mode in ('ratio', 'ratio_fix')
+        need_probs = verify_mode in ('ratio', 'ratio_fix', 'rsd')
+        keep_dists = verify_mode == 'rsd'
+        draft_T = (temperature if verify_mode == 'rsd'
+                   else (max(temperature, 1.0) if temperature > 0 else 1.0))
         tree, dt = build_draft_tree_incremental(
             draft_model, draft_state, exit_layer, gamma, top_k, budget,
-            draft_mode=draft_mode, temperature=max(temperature, 1.0) if temperature > 0 else 1.0,
-            need_probs=need_probs, draft_top_k_vocab=draft_top_k_vocab)
+            draft_mode=draft_mode, temperature=draft_T,
+            need_probs=need_probs, draft_top_k_vocab=draft_top_k_vocab,
+            keep_dists=keep_dists)
         total_draft_time += dt
 
         new_tokens, n_acc, tt, target_state, best_path = verify_tree_step(
@@ -239,7 +243,9 @@ def baseline_chain_decode(target_model, draft_model, input_ids,
                             draft_probs_list.append(d_probs[0].detach())
                 else:  # argmax
                     next_tok = logits.argmax(-1, keepdim=True)
-                    if verify_mode in ('ratio', 'ratio_fix'):
+                    # Include rsd/exclusive: baseline remaps them to ratio and
+                    # needs real p_draft, not a dummy 1.0.
+                    if verify_mode in ('ratio', 'ratio_fix', 'rsd', 'exclusive'):
                         d_probs = torch.softmax(logits / T_d, dim=-1)
                         p_draft_at = d_probs[0, next_tok[0, 0]].item()
                         if need_full_probs:
@@ -287,11 +293,16 @@ def baseline_chain_decode(target_model, draft_model, input_ids,
         eff_verify = verify_mode
         if eff_verify == 'auto':
             eff_verify = 'greedy' if temperature == 0.0 else 'simple'
+        # Chain baseline has no tree / residual siblings. Map tree-only modes
+        # onto the closest chain rule so --verify-mode rsd (used for tree eval)
+        # does not leave n_accepted unset.
+        if eff_verify in ('rsd', 'exclusive'):
+            eff_verify = 'ratio'
         draft_cpu = draft_tokens[0].cpu().tolist()
+        n_accepted = 0
         if eff_verify == 'greedy':
             t_argmax = t_out.logits[0].argmax(dim=-1)
             t_argmax_cpu = t_argmax.cpu().tolist()
-            n_accepted = 0
             for i in range(gamma):
                 if t_argmax_cpu[i] == draft_cpu[i]:
                     n_accepted += 1
@@ -305,7 +316,6 @@ def baseline_chain_decode(target_model, draft_model, input_ids,
                 tv, ti = t_probs.topk(target_top_k, dim=-1)
                 tn = tv / tv.sum(-1, keepdim=True).clamp(min=1e-20)
                 t_probs = torch.zeros_like(t_probs).scatter_(-1, ti, tn)
-            n_accepted = 0
             for i in range(gamma):
                 p_t = t_probs[i, draft_cpu[i]].item()
                 if random.random() <= p_t:
@@ -323,7 +333,9 @@ def baseline_chain_decode(target_model, draft_model, input_ids,
                 tv, ti = t_probs.topk(target_top_k, dim=-1)
                 tn = tv / tv.sum(-1, keepdim=True).clamp(min=1e-20)
                 t_probs = torch.zeros_like(t_probs).scatter_(-1, ti, tn)
-            n_accepted = 0
+            # Ensure draft_p_list is populated when verify was remapped from rsd.
+            if len(draft_p_list) < gamma:
+                draft_p_list = [1.0] * gamma
             for i in range(gamma):
                 p_t = t_probs[i, draft_cpu[i]].item()
                 p_d = draft_p_list[i]
@@ -349,6 +361,10 @@ def baseline_chain_decode(target_model, draft_model, input_ids,
                     correction = torch.multinomial(t_probs[n_accepted], 1).view(1, 1)
             else:  # 'ratio' (legacy — biased correction)
                 correction = torch.multinomial(t_probs[n_accepted], 1).view(1, 1)
+        else:
+            raise ValueError(
+                f"baseline_chain_decode: unsupported verify_mode={verify_mode!r} "
+                f"(effective={eff_verify!r})")
         new_tokens = torch.cat(
             [draft_tokens[:, :n_accepted], correction], dim=1)   # [1, n_acc+1]
 
@@ -438,17 +454,22 @@ def main():
                         action='store_false',
                         help='Disable Qwen3 thinking mode in chat template.')
     parser.add_argument('--path-topk', type=int, default=0,
-                        help='If >0, only the paths with the largest product of '
-                             'draft node probabilities are verified. Accept length '
-                             'is the longest target-argmax prefix among them.')
+                        help='If >0, keep only the paths with the largest product of '
+                             'draft node probabilities. For greedy/simple/ratio: AL is '
+                             'the longest accepted prefix among them. For rsd: residual '
+                             'verify runs only on that path union (same as sample_rsd '
+                             'training); off-union siblings do not consume residual mass.')
     parser.add_argument('--verify-mode',
-                        choices=['auto', 'greedy', 'simple', 'ratio', 'ratio_fix', 'exclusive'],
+                        choices=['auto', 'greedy', 'simple', 'ratio', 'ratio_full',
+                                 'exclusive', 'rsd'],
                         default='auto',
                         help='Target verify rule: auto=greedy if T=0 else simple; '
                              'greedy=argmax match; simple=r ≤ p_t; ratio=r ≤ p_t/p_d; '
-                             'ratio_fix=ratio + correction from normalize(max(0, p_t - p_d)) '
+                             'ratio_full=ratio + correction from normalize(max(0, p_t - p_d)) '
                              '(exact SpecDec correction); exclusive=one draw from p per '
-                             'slot, siblings mutually exclusive.')
+                             'slot, siblings mutually exclusive; '
+                             'rsd=residual sibling verify on the path-topk union '
+                             '(matches sample_rsd training; use --path-topk 4).')
     args = parser.parse_args()
 
     # Parse top_k (int or comma-separated list)

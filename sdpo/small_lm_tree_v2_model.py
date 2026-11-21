@@ -25,6 +25,19 @@ Per training step, per sample:
        E[L] = sum over nodes of prod_{v on path} alpha_v (siblings are mutually
        exclusive under one target draw per slot). loss = -E[L].
        Eval must use --draft-mode sample --verify-mode ratio.
+     sample_rsd (online Sampled tree EAL): draft samples the full tree, keeps
+       the --path_topk draft-score paths, and target verifies ONLY that
+       pruned union. Residual EAL:
+       P(A(v)) = P(parent) * prod_{u before v}(1-a(u)) * a(v) with
+       a = min(1, u/q); after reject u <- norm(max(u-q,0)), q drops v.
+       E[L] = sum_v P(A(v)). loss ≈ -E[L] (+ score-fn; optional KL).
+       Eval: --draft-mode sample --verify-mode rsd --path-topk K (RSD walks
+       only the same path-topk union; off-union siblings do not consume
+       residual mass).
+     sample_rsd_offline: draft still samples a fresh tree and keeps --path_topk
+       paths; target logits come from --srsd_cache (a bank of target-verified
+       paths). A draft path is kept only if its token sequence matches a
+       cached path; otherwise it is discarded. Training never runs target.
      soft_topk: greedy top-k tree, -E[L] on the Top-K path union with forward
        alpha = p_target(token) and a p - q straight-through backward.
      budget / path_topk: anchor_kl_coef * KL - eal_aux_coef * E[L_tree], where
@@ -33,6 +46,7 @@ Per training step, per sample:
 
 import contextlib
 import math
+import random
 
 import torch
 import torch.nn as nn
@@ -288,6 +302,146 @@ def _center_by_group(x, group):
     return torch.where(cnt[g] > 1, out, torch.zeros_like(out))
 
 
+def _wor_logprob(logits, toks, temperature=1.0):
+    """Sequential without-replacement log-prob of `toks` under `logits`.
+
+    logits: [B, V] with toks [B, K], or [B, N, V] with toks [B, N, K].
+    Tokens are treated as stopgrad ids; gradients flow through logits only.
+    """
+    T = max(float(temperature), 1e-6)
+    if logits.dim() == 2:
+        B, K = toks.shape
+        log_p = F.log_softmax(logits / T, dim=-1)
+        neg_inf = torch.finfo(log_p.dtype).min
+        # Out-of-place mask updates: inplace scatter_ on `blocked` breaks
+        # autograd versioning through masked_fill.
+        blocked = torch.zeros_like(log_p, dtype=torch.bool)
+        total = logits.new_zeros(B)
+        for t in range(K):
+            lp = log_p.masked_fill(blocked, neg_inf)
+            lp = lp - torch.logsumexp(lp, dim=-1, keepdim=True)
+            total = total + lp.gather(-1, toks[:, t:t + 1]).squeeze(-1)
+            blocked = blocked.scatter(1, toks[:, t:t + 1], True)
+        return total
+    if logits.dim() != 3 or toks.dim() != 3:
+        raise ValueError(
+            f"_wor_logprob expected [B,V]+[B,K] or [B,N,V]+[B,N,K], "
+            f"got logits {tuple(logits.shape)} toks {tuple(toks.shape)}")
+    B, N, K = toks.shape
+    log_p = F.log_softmax(logits / T, dim=-1)
+    neg_inf = torch.finfo(log_p.dtype).min
+    blocked = torch.zeros_like(log_p, dtype=torch.bool)
+    total = logits.new_zeros(B, N)
+    for t in range(K):
+        lp = log_p.masked_fill(blocked, neg_inf)
+        lp = lp - torch.logsumexp(lp, dim=-1, keepdim=True)
+        total = total + lp.gather(-1, toks[:, :, t:t + 1]).squeeze(-1)
+        blocked = blocked.scatter(-1, toks[:, :, t:t + 1], True)
+    return total
+
+
+def sampled_tree_rsd_eal(tokens, tgt_node, drf_node, parents, temperature=1.0,
+                         node_mask=None):
+    """Sampled-tree E[L] with residual sibling verification (slides).
+
+    Given an already-sampled draft tree, siblings under a parent are tested in
+    their sample order. For node v:
+      a(v) = min(1, u[v]/q[v]) under the current residual (u, q);
+      b(v) = prod_{u before v}(1 - a(u)) * a(v);
+      P(A(v)) = P(A(parent)) * b(v)   (root parent mass = 1);
+    after rejecting v: u <- norm(max(u - q, 0)), q[v] <- 0 and renorm q.
+    E[L] = sum_v P(A(v)). Target u is detached.
+
+    Gradient: residual (u, q) trajectories are stopgrad — autodiff through the
+    dense V-dim p−q / renorm Jacobian blows up grad_norm (~100) and swamps the
+    accept signal. Forward a(v) still uses the exact residual masses; live
+    draft grad flows only through q_live[x] via
+      q_res[x] = q_live[x] / sum_{alive} q_live   (denom detached),
+    matching sample_anyk's gather-only pattern. Sampling the tree itself is
+    still stopgrad; pair with the score-function term (n_draws>=2).
+    parents may be [N] or [B, N] (topology shared across the batch).
+    node_mask [B, N] bool (optional): offline / path-limited training — only
+    masked-in nodes are verified; residual sibling updates run among the
+    kept siblings only (as if the other branches were never cached).
+    """
+    B, N = tokens.shape
+    T = max(float(temperature), 1e-6)
+    V = drf_node.size(-1)
+    q_floor = 1e-9
+    p_full = torch.softmax(tgt_node / T, dim=-1).detach()
+    q_full = torch.softmax(drf_node / T, dim=-1)
+    # Collect (flat_index, value) then one index_put — avoids inplace writes into a
+    # tensor that earlier sibling/parent reads still view during backward.
+    flat_idx = []
+    flat_val = []
+    for b in range(B):
+        parents_b = parents[b] if parents.dim() == 2 else parents
+        children = [[] for _ in range(N)]
+        roots = []
+        for i in range(N):
+            if node_mask is not None and not bool(node_mask[b, i]):
+                continue
+            p = int(parents_b[i].item())
+            if p < 0:
+                roots.append(i)
+            else:
+                children[p].append(i)
+        # P_node[i] local to this batch row (no shared storage with outputs).
+        P_node = [None] * N
+        groups = [roots] + [children[i] for i in range(N) if children[i]]
+        for sibs in groups:
+            if not sibs:
+                continue
+            sibs = sorted(sibs)
+            head = sibs[0]
+            par = int(parents_b[head].item())
+            q_live = q_full[b, head, :]
+            q_det = q_live.detach()
+            P_par = (P_node[par] if par >= 0 else q_live.new_ones(()))
+            # Residual (p, alive) trajectory under stopgrad; record p[x] and the
+            # alive-mass denom so a(v) can reattach through q_live[x] only.
+            with torch.no_grad():
+                p = p_full[b, head, :].clone()
+                alive = torch.ones(V, device=q_det.device, dtype=q_det.dtype)
+                q_res = q_det.clone()
+                p_x_list = []
+                denom_list = []
+                for t, node in enumerate(sibs):
+                    x = int(tokens[b, node].item())
+                    denom = (q_det * alive).sum().clamp(min=q_floor)
+                    p_x_list.append(p[x].clone())
+                    denom_list.append(denom.clone())
+                    if t + 1 == len(sibs):
+                        break
+                    p = torch.clamp(p - q_res, min=0.0)
+                    p = p / p.sum().clamp(min=q_floor)
+                    alive = alive.scatter(
+                        0, torch.tensor([x], device=alive.device),
+                        torch.zeros(1, device=alive.device, dtype=alive.dtype))
+                    q_res = q_det * alive
+                    q_res = q_res / q_res.sum().clamp(min=q_floor)
+            reach = q_live.new_ones(())
+            for t, node in enumerate(sibs):
+                x = int(tokens[b, node].item())
+                q_x = q_live[x] / denom_list[t]
+                a = (p_x_list[t] / q_x.clamp(min=q_floor)).clamp(max=1.0)
+                pav = P_par * reach * a
+                P_node[node] = pav
+                flat_idx.append(b * N + node)
+                flat_val.append(pav)
+                reach = reach * (1.0 - a)
+    if not flat_val:
+        z = q_full.new_zeros(B)
+        return z, q_full.new_zeros(B, N)
+    P_accept = q_full.new_zeros(B * N)
+    P_accept = P_accept.index_put(
+        (torch.tensor(flat_idx, device=q_full.device, dtype=torch.long),),
+        torch.stack(flat_val),
+        accumulate=False,
+    ).view(B, N)
+    return P_accept.sum(dim=-1), P_accept
+
+
 def tree_path_sum_eal(alpha, parents):
     """E[L] = sum over nodes of prod of alpha along the root-to-node path.
 
@@ -429,6 +583,16 @@ def induce_path_topk_union(full_parents, paths, path_scores, path_topk):
         raise ValueError(f"path_topk must be >= 1, got {path_topk}")
     device = path_scores.device
     sel = path_scores.topk(k, dim=-1).indices
+    return induce_path_indices_union(full_parents, paths, sel) + (sel,)
+
+
+def induce_path_indices_union(full_parents, paths, sel):
+    """Union of explicitly chosen complete paths.
+
+    sel: [B, K] path indices into `paths`. Returns parents [B, M] and
+    gather_index [B, M] (full-tree node id, or -1 pad).
+    """
+    device = sel.device
     chains = paths.to(device)[sel]
     unions = [torch.unique(chains[b].reshape(-1), sorted=True) for b in range(chains.size(0))]
     max_n = max(int(u.numel()) for u in unions)
@@ -442,7 +606,7 @@ def induce_path_topk_union(full_parents, paths, path_scores, path_topk):
         mapped = torch.searchsorted(uniq, old_parent.clamp(min=0))
         parents_out[b, :n] = torch.where(
             old_parent >= 0, mapped, torch.full_like(mapped, -1))
-    return parents_out, gather_index, sel
+    return parents_out, gather_index
 
 
 def _expected_acceptance(draft_logits, target_logits, temperature):
@@ -765,7 +929,8 @@ def decode_window_starts(drf_hidden, tgt_hidden, drf_head, tgt_head, loss_mask,
 def dense_tree_loss(drf_hidden, tgt_hidden, drf_head, tgt_head, loss_mask,
                     top_k, tau, var_coef=0.0, start_only=False, chunk=256,
                     starts=None, path_n=None, temp=1.0, prob_starts=False,
-                    path_margin=None, prob_region=None, eal_region=None):
+                    path_margin=None, prob_region=None, eal_region=None,
+                    boundary_tau=0.0, path_agg="mean", eal_alpha=0.0):
     """Teacher-forced greedy tree loss over every supervised position.
 
     Greedy tree verification follows the target mode u, so depth j of a window
@@ -790,6 +955,13 @@ def dense_tree_loss(drf_hidden, tgt_hidden, drf_head, tgt_head, loss_mask,
     At tau -> 0 this is the exact accept length. With prob_region the
     recursion starts (rho = 1) at the region's first position and stays
     inside it; eal_region then restricts the weighted E[L] to a sub-range.
+    boundary_tau > 0 replaces the path E[L] by the mean over the positions a
+    window actually reaches (its accepted tokens plus the first rejected one)
+    of softplus(-(z(u) - z_(k_j)) / boundary_tau), returned negated as the E[L].
+    path_agg="max" scores a window by its longest kept path instead of the
+    mean, matching eval, which accepts along the longest path.
+    eal_alpha > 0 smooths each path factor to (1 - eal_alpha) q_j + eal_alpha
+    as in D-PACE, so deep terms keep weight when q is small.
     Chunks are checkpointed so [B, L, V] logits never coexist with the graph.
     """
     from torch.utils.checkpoint import checkpoint
@@ -834,7 +1006,22 @@ def dense_tree_loss(drf_hidden, tgt_hidden, drf_head, tgt_head, loss_mask,
             starts = _renewal_start_prob(torch.cumprod(rank, -1) * keep, region)
             if eal_region is not None:
                 starts = starts * eal_region.float()
-        q = torch.exp(z_u / temp - lse_t) * mf
+        if boundary_tau > 0:
+            k_idx = torch.tensor([k - 1 for k in top_k], device=kth.device)
+            thr = kth.index_select(-1, k_idx)
+            mg = torch.stack([z_u[:, j:j + usable] - thr[:, j:j + usable, j]
+                              for j in range(gamma)], -1)               # [B, U, gamma]
+            mw = torch.stack([mf[:, j:j + usable] for j in range(gamma)], -1)
+            reach = (torch.arange(gamma, device=mg.device).view(1, 1, -1)
+                     <= path_n[:, :usable].max(-1).values.unsqueeze(-1)).float()
+            rw = reach * mw * starts[:, :usable].float().unsqueeze(-1)
+            bnd = (F.softplus(-mg / boundary_tau) * rw).sum() / (rw.sum() + 1e-8)
+            w = starts[:, :usable].float()
+            dense_tree_loss.last_windows_per_seq = float(w.sum()) / w.size(0)
+            hard_mean = (path_n[:, :usable].max(-1).values.float() * w).sum() / (w.sum() + 1e-8)
+            return kl_mean, -bnd, bnd.detach() * 0.0, hard_mean
+        q = torch.exp(z_u / temp - lse_t)
+        q = ((1.0 - eal_alpha) * q + eal_alpha) * mf
         q_win = torch.stack([q[:, j:j + usable] for j in range(gamma)], dim=-1)
         cp = torch.cumprod(q_win, dim=-1)                               # [B, U, gamma]
         m = path_n[:, :usable]                                          # [B, U, k]
@@ -844,7 +1031,8 @@ def dense_tree_loss(drf_hidden, tgt_hidden, drf_head, tgt_head, loss_mask,
         w = starts[:, :usable].float()
         ws = w.sum() + 1e-8
         dense_tree_loss.last_windows_per_seq = float(w.sum()) / w.size(0)
-        eal_mean = (chain.mean(-1) * w).sum() / ws
+        agg = chain.max(-1).values if path_agg == "max" else chain.mean(-1)
+        eal_mean = (agg * w).sum() / ws
         var_mean = (chain.var(dim=-1, unbiased=False) * w).sum() / ws
         hard_mean = (m.max(-1).values.float() * w).sum() / ws
         return kl_mean, eal_mean, var_mean, hard_mean
@@ -880,6 +1068,43 @@ def dense_tree_loss(drf_hidden, tgt_hidden, drf_head, tgt_head, loss_mask,
     else:
         var_mean = eal_mean.detach() * 0.0
     return kl_mean, eal_mean, var_mean, hard_mean
+
+
+def _nll_chunk(drf_h, tgt_h, drf_head, tgt_head):
+    with torch.no_grad():
+        u = tgt_head(tgt_h).argmax(dim=-1)
+    lq = F.log_softmax(drf_head(drf_h).float(), dim=-1)
+    return -lq.gather(-1, u.unsqueeze(-1)).squeeze(-1)
+
+
+def dpace_loss(drf_hidden, tgt_hidden, drf_head, tgt_head, loss_mask, gamma,
+               alpha, chunk=256):
+    """D-PACE (dynamic position-aware CE) with a block of `gamma` draft
+    positions opened at every supervised position s. In a block, position j
+    gets the detached weight w_j = sum_{d >= j} prod_{i <= d} ((1 - alpha) q_i
+    + alpha), q_i the draft probability of the target greedy token, and the
+    loss is sum_blocks sum_j w_j CE_j per supervised token."""
+    from torch.utils.checkpoint import checkpoint
+    mask = loss_mask[:, 1:].bool()
+    dh, th = drf_hidden[:, :-1], tgt_hidden[:, :-1]
+    L = dh.size(1)
+    nll = torch.cat([checkpoint(_nll_chunk, dh[:, s:s + chunk], th[:, s:s + chunk],
+                                drf_head, tgt_head, use_reentrant=False)
+                     for s in range(0, L, chunk)], 1)
+    mf = mask.float()
+    with torch.no_grad():
+        smooth = torch.where(mask, (1 - alpha) * torch.exp(-nll) + alpha,
+                             torch.ones_like(nll))
+        sp = F.pad(smooth, (0, gamma), value=1.0)
+        vp = F.pad(mf, (0, gamma))
+        sw = torch.stack([sp[:, j:j + L] for j in range(gamma)], -1)
+        vw = torch.stack([vp[:, j:j + L] for j in range(gamma)], -1)
+        pre = torch.cumprod(sw, -1) * vw
+        w = pre.flip(-1).cumsum(-1).flip(-1) * vw * mf.unsqueeze(-1)
+        W = torch.zeros_like(nll)
+        for j in range(gamma):
+            W[:, j:] += w[:, :L - j, j]
+    return (nll * W * mf).sum() / (mf.sum() + 1e-8)
 
 
 def chain_style_tree_eal(draft_logits, target_logits, tokens, parents, valid,
@@ -1046,6 +1271,8 @@ class SmallLMTreeV2Model(nn.Module):
         super().train(mode)
         self.target_model.eval()
         self.draft_model.train(mode)
+        if getattr(self, "ref_draft", None) is not None:
+            self.ref_draft.eval()
         return self
 
     def _target_tree_mask(self, prefix_len, device, dtype):
@@ -1168,12 +1395,22 @@ class SmallLMTreeV2Model(nn.Module):
         root_lp = F.log_softmax(drf_root, dim=-1)
         # sample_minpq: the draft SAMPLES k distinct children per node at T,
         # matching eval --draft-mode sample. Otherwise greedy top-k.
-        sample_tree = eal_mode in ("sample_minpq", "sample_anyk", "sample_cover")
+        sample_tree = eal_mode in (
+            "sample_minpq", "sample_anyk", "sample_cover",
+            "sample_rsd", "sample_rsd_offline")
+        # Full-tree sampling log π(τ) for sample_rsd reinforce / hybrid (WoR).
+        _srsd_gm = str(getattr(self, "srsd_grad_mode", "pq_ratio"))
+        need_tree_log_pi = (
+            sample_tree and eal_mode == "sample_rsd"
+            and _srsd_gm in ("reinforce", "minpq_reinforce"))
+        tree_log_pi = None
         if sample_tree:
             with torch.no_grad():
                 root_tok = torch.multinomial(
                     torch.softmax(drf_root / T, dim=-1), top_k[0], replacement=False)
             root_scores = root_lp.gather(-1, root_tok)
+            if need_tree_log_pi:
+                tree_log_pi = _wor_logprob(drf_root, root_tok, temperature=T)
         else:
             root_scores, root_tok = root_lp.topk(top_k[0], dim=-1)
 
@@ -1218,6 +1455,9 @@ class SmallLMTreeV2Model(nn.Module):
                     child_tok = torch.multinomial(
                         flat_p, k, replacement=False).view(B, n_in, k)
                 child_sc = child_lp.gather(-1, child_tok)
+                if need_tree_log_pi:
+                    tree_log_pi = tree_log_pi + _wor_logprob(
+                        depth_pred, child_tok, temperature=T).sum(dim=1)
             else:
                 child_sc, child_tok = child_lp.topk(k, dim=-1)
             cum = scores_per_depth[-1].unsqueeze(-1) + child_sc
@@ -1282,35 +1522,183 @@ class SmallLMTreeV2Model(nn.Module):
                 list(self.tree_depths[:n_prefix]) + [gamma - 1] * last_sel.size(1),
                 device=device, dtype=torch.long)
 
-        tgt_cache, max_kv_t = _pad_cache_batch(tgt_keys, tgt_values, batch_idx, kv_lens)
-        assert max_kv_t == max_kv
-        pos = a_t.view(B, 1) + 1 + depths.view(1, -1)
-        tree_mask = self._target_mask_batch(
-            kv_lens, max_kv, parents, device, self.target_model.dtype)
-        with torch.no_grad():
-            tgt_out = self.target_model(
-                input_ids=tokens,
-                attention_mask=tree_mask,
-                position_ids=pos,
-                past_key_values=tgt_cache,
-                use_cache=False,
-                return_dict=True,
+        # sample_rsd: Expand(draft) → Score → Prune top-k paths → Verify(target)
+        # only on the pruned union. Offline uses a disk cache instead (see
+        # forward_srsd_offline); reaching sample_rsd_offline here is an error.
+        node_mask = None
+        if eal_mode == "sample_rsd_offline":
+            raise RuntimeError(
+                "sample_rsd_offline must be trained from --srsd_cache "
+                "(no online target verify)")
+        if eal_mode == "sample_rsd":
+            if last_sel is not None or full_leaf_sc is None:
+                raise RuntimeError(
+                    "sample_rsd needs every complete path scored before the "
+                    "node-budget prune; set tree_budget to cover the full tree")
+            k_paths = min(int(path_topk), int(full_leaf_sc.size(1)))
+            if k_paths <= 0:
+                raise RuntimeError("sample_rsd requires --path_topk > 0")
+            union_parents, gather_index, path_sel = induce_path_topk_union(
+                self.tree_parents, self.paths, full_leaf_sc.detach(), k_paths)
+            valid_u = gather_index >= 0
+            M = gather_index.size(1)
+            gi = gather_index.clamp(min=0)
+            tok_u = torch.where(valid_u, tokens.gather(1, gi), torch.zeros_like(gi))
+            dep_full = depths.to(device=device, dtype=torch.long).view(1, -1).expand(B, -1)
+            depths_u = torch.where(valid_u, dep_full.gather(1, gi), torch.zeros_like(gi))
+            drf_u = drf_node.gather(
+                1, gi.unsqueeze(-1).expand(B, M, drf_node.size(-1)))
+            path_tpl = self.paths.to(device)
+            path_nodes = path_tpl[path_sel]  # [B, K, gamma]
+            path_toks = tokens.gather(
+                1, path_nodes.reshape(B, -1)).view(B, k_paths, gamma)
+
+            # Online target path cache: skip target forward when every kept
+            # path's token sequence is already in the LRU bank.
+            try:
+                from sdpo.srsd_tgt_cache import path_key
+            except ImportError:
+                from srsd_tgt_cache import path_key
+            bank = getattr(self, "_srsd_tgt_bank", None)
+            ctx_keys = getattr(self, "_srsd_ctx_keys", None)
+            use_bank = bank is not None and bool(getattr(self, "srsd_tgt_cache", False))
+            row_hit = torch.zeros(B, dtype=torch.bool, device=device)
+            path_entries = [[None] * k_paths for _ in range(B)]
+            if use_bank and ctx_keys is not None:
+                for b in range(B):
+                    ctx = ctx_keys[b]
+                    all_h = True
+                    for ki in range(k_paths):
+                        key = path_key(ctx, path_toks[b, ki])
+                        ent = bank.get(key)
+                        path_entries[b][ki] = (key, ent)
+                        if ent is None:
+                            all_h = False
+                    row_hit[b] = all_h
+
+            V = int(drf_u.size(-1))
+            if use_bank and bool(row_hit.all().item()):
+                # Reconstruct dense parent-slot logits from cached top-m.
+                tgt_node = drf_u.new_empty(B, M, V)
+                for b in range(B):
+                    live_to_dense = {}
+                    for ki in range(k_paths):
+                        _key, ent = path_entries[b][ki]
+                        ids_c, logits_c = ent
+                        dense = bank.reconstruct(ids_c, logits_c, V, device)
+                        for d in range(gamma):
+                            live_n = int(path_nodes[b, ki, d].item())
+                            live_to_dense[live_n] = dense[d]
+                    for j in range(M):
+                        if not bool(valid_u[b, j]):
+                            tgt_node[b, j] = 0
+                            continue
+                        live_n = int(gather_index[b, j].item())
+                        tgt_node[b, j] = live_to_dense[live_n]
+                self._srsd_cache_skipped = float(B)
+            else:
+                tgt_cache, max_kv_t = _pad_cache_batch(
+                    tgt_keys, tgt_values, batch_idx, kv_lens)
+                assert max_kv_t == max_kv
+                pos_u = a_t.view(B, 1) + 1 + depths_u
+                tree_mask_u = self._target_mask_batch(
+                    kv_lens, max_kv, union_parents, device, self.target_model.dtype)
+                with torch.no_grad():
+                    tgt_out = self.target_model(
+                        input_ids=tok_u,
+                        attention_mask=tree_mask_u,
+                        position_ids=pos_u,
+                        past_key_values=tgt_cache,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                tgt_tree_u = tgt_out.logits.float()
+                del tgt_out
+                has_par_u = union_parents >= 0
+                gathered_u = tgt_tree_u.gather(
+                    1, union_parents.clamp(min=0).unsqueeze(-1).expand(
+                        B, M, tgt_tree_u.size(-1)))
+                tgt_node = torch.where(
+                    has_par_u.unsqueeze(-1),
+                    gathered_u,
+                    tgt_root.unsqueeze(1).expand(B, M, -1),
+                )
+                self._srsd_cache_skipped = (
+                    float(row_hit.float().sum().item()) if use_bank else 0.0)
+                # Insert verified paths into the online bank (top-m).
+                if use_bank and ctx_keys is not None:
+                    for b in range(B):
+                        if bool(row_hit[b].item()):
+                            continue
+                        ctx = ctx_keys[b]
+                        full_to_u = {}
+                        for j in range(M):
+                            if bool(valid_u[b, j]):
+                                full_to_u[int(gather_index[b, j].item())] = j
+                        for ki in range(k_paths):
+                            key = path_key(ctx, path_toks[b, ki])
+                            cols = []
+                            ok = True
+                            for d in range(gamma):
+                                live_n = int(path_nodes[b, ki, d].item())
+                                j = full_to_u.get(live_n)
+                                if j is None:
+                                    ok = False
+                                    break
+                                cols.append(j)
+                            if not ok:
+                                continue
+                            full = torch.stack(
+                                [tgt_node[b, j] for j in cols], dim=0)
+                            ids_c, logits_c = bank.pack_from_full(
+                                full, path_toks[b, ki])
+                            bank.put(key, ids_c, logits_c)
+            tokens, parents, depths = tok_u, union_parents, depths_u
+            drf_node, N = drf_u, M
+            node_mask = valid_u
+            tgt_tree = None
+        else:
+            tgt_cache, max_kv_t = _pad_cache_batch(
+                tgt_keys, tgt_values, batch_idx, kv_lens)
+            assert max_kv_t == max_kv
+            pos = a_t.view(B, 1) + 1 + depths.view(1, -1)
+            tree_mask = self._target_mask_batch(
+                kv_lens, max_kv, parents, device, self.target_model.dtype)
+            with torch.no_grad():
+                tgt_out = self.target_model(
+                    input_ids=tokens,
+                    attention_mask=tree_mask,
+                    position_ids=pos,
+                    past_key_values=tgt_cache,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            tgt_tree = tgt_out.logits.float()
+            del tgt_out
+            has_parent = parents >= 0
+            gathered = tgt_tree.gather(
+                1, parents.clamp(min=0).unsqueeze(-1).expand(
+                    B, N, tgt_tree.size(-1)))
+            tgt_node = torch.where(
+                has_parent.unsqueeze(-1),
+                gathered,
+                tgt_root.unsqueeze(1).expand(B, N, -1),
             )
-        tgt_tree = tgt_out.logits.float()
-        del tgt_out
-        has_parent = parents >= 0
-        gathered = tgt_tree.gather(
-            1, parents.clamp(min=0).unsqueeze(-1).expand(B, N, tgt_tree.size(-1)))
-        tgt_node = torch.where(
-            has_parent.unsqueeze(-1),
-            gathered,
-            tgt_root.unsqueeze(1).expand(B, N, -1),
-        )
 
         if skip_full_logits or eal_mode in (
                 "soft_topk", "sample_minpq", "sample_anyk", "sample_cover",
                 "wsoft", "greedy_topk", "dense_tree", "top4_kl_eal"):
             kl = drf_root.new_zeros(())
+        elif eal_mode == "sample_rsd":
+            slot = parents + 1
+            n_sib = torch.zeros(B, N + 1, device=device).scatter_add_(
+                1, slot, node_mask.float())
+            w_kl = node_mask.float() / n_sib.gather(1, slot).clamp(min=1.0)
+            tgt_logp = F.log_softmax(tgt_node, dim=-1)
+            kl_node = (tgt_logp.exp() * (
+                tgt_logp - F.log_softmax(drf_node, dim=-1))).sum(-1).clamp(min=0.0)
+            kl = (kl_node * w_kl).sum() / w_kl.sum().clamp(min=1.0)
+            del tgt_logp
         else:
             tgt_logp = F.log_softmax(tgt_node, dim=-1)
             tgt_p = tgt_logp.exp()
@@ -1438,6 +1826,69 @@ class SmallLMTreeV2Model(nn.Module):
                 accept = torch.rand_like(ratio) <= ratio
                 eal = longest_path_from_accept(accept, parents)
             n_report = int(N)
+        elif eal_mode == "sample_rsd":
+            # Residual analytic E[L|tree] on the path-topk union (matches eval
+            # RSD). Gradient mode (--srsd_grad_mode):
+            #   pq_ratio: live value through a=min(1,p/q) + mean-log-q score
+            #             (legacy; value is anti-sampling).
+            #   minpq:    value through α=min(p,q) path-sum (ALTV-shaped ∇q);
+            #             still log RSD E[L].
+            #   reinforce: RSD E[L] as stopgrad reward; WoR log π(τ) score only.
+            #   minpq_reinforce: dense minpq value + reinforce score (hybrid).
+            grad_mode = str(getattr(self, "srsd_grad_mode", "pq_ratio"))
+            eal_cond, _P_node = sampled_tree_rsd_eal(
+                tokens, tgt_node, drf_node, parents, temperature=T,
+                node_mask=node_mask)
+            tok_idx = tokens.long().unsqueeze(-1)
+
+            def _minpq_value():
+                p_n = torch.softmax(tgt_node / T, dim=-1).gather(
+                    -1, tok_idx).squeeze(-1).detach()
+                q_n = torch.softmax(drf_node / T, dim=-1).gather(
+                    -1, tok_idx).squeeze(-1)
+                a = torch.minimum(p_n, q_n)
+                if node_mask is not None:
+                    a = a * node_mask.float()
+                return tree_path_sum_eal(a, parents)
+
+            def _reinforce_score():
+                # Unbiased score for J = E_τ[RSD E[L|τ]]: stopgrad reward,
+                # WoR log π(τ). Advantage is within-anchor standardized +
+                # clamped; log π is magnitude-normalized so deep trees do not
+                # explode grad_norm (F2 ablate saw gn~500).
+                if tree_log_pi is None:
+                    raise RuntimeError(
+                        f"srsd_grad_mode={grad_mode} needs WoR tree_log_pi")
+                adv = _center_by_group(eal_cond.detach(), anchor_group)
+                adv = adv.clamp(-5.0, 5.0)
+                lp_scale = tree_log_pi.detach().abs().mean().clamp(min=1.0)
+                score_coef = float(eal_score_coef)
+                if score_coef == 0.0:
+                    score_coef = 1.0
+                return score_coef * (adv * (tree_log_pi / lp_scale)).mean()
+
+            if grad_mode == "minpq":
+                eal_loss = -_minpq_value().mean()
+            elif grad_mode == "reinforce":
+                eal_loss = -_reinforce_score()
+            elif grad_mode == "minpq_reinforce":
+                # Dense ALTV-shaped ∇q on tokens + discrete ∇ over tree τ.
+                eal_loss = -(_minpq_value().mean() + _reinforce_score())
+            else:
+                # pq_ratio (legacy)
+                log_q = torch.log_softmax(drf_node / T, dim=-1).gather(
+                    -1, tok_idx).squeeze(-1)
+                if node_mask is not None:
+                    w = node_mask.float()
+                    score = (log_q * w).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
+                else:
+                    score = log_q.mean(dim=1)
+                adv = _center_by_group(eal_cond.detach(), anchor_group)
+                eal_loss = -(eal_cond.mean()
+                             + float(eal_score_coef) * (adv * score).mean())
+            # Always log analytic RSD E[L|tree] (eval-aligned metric).
+            eal = eal_cond.detach().mean()
+            n_report = float(node_mask.float().sum(dim=-1).mean().item())
         elif eal_mode == "sample_cover":
             # One target draw per slot, siblings mutually exclusive. The cover
             # of a slot is c = 1 - sum_v p(v) (1-q(v))^k with k equal to that
@@ -1655,15 +2106,38 @@ class SmallLMTreeV2Model(nn.Module):
                 eal_loss = -tree_expected_accepted_length(
                     alpha_s, union_parents).mean()
                 eal = longest_accepted_path(tokens, parents, tgt_node)
+                # Path-union sibling-normalized KL so --anchor_kl_coef is live
+                # (previously soft_topk forced kl=0 and ignored the coef).
+                if float(anchor_kl_coef) != 0.0:
+                    gi = gather_index.clamp(min=0)
+                    V = full_drf.size(-1)
+                    drf_u = full_drf.gather(
+                        1, gi.unsqueeze(-1).expand(-1, -1, V))
+                    tgt_u = full_tgt.gather(
+                        1, gi.unsqueeze(-1).expand(-1, -1, V))
+                    slot = union_parents + 1
+                    U = int(gi.size(1))
+                    n_sib = torch.zeros(
+                        B, U + 1, device=device).scatter_add_(
+                            1, slot.clamp(min=0), valid.float())
+                    w_kl = valid.float() / n_sib.gather(
+                        1, slot.clamp(min=0)).clamp(min=1.0)
+                    tgt_logp = F.log_softmax(tgt_u, dim=-1)
+                    kl_node = (tgt_logp.exp() * (
+                        tgt_logp - F.log_softmax(drf_u, dim=-1))
+                        ).sum(-1).clamp(min=0.0)
+                    kl = (kl_node * w_kl).sum() / w_kl.sum().clamp(min=1.0)
+                    del tgt_logp, drf_u, tgt_u
             else:
                 eal = tree_expected_accepted_length(alpha_u, union_parents).mean()
                 eal_loss = None
         else:
             raise ValueError(
                 "eal_mode must be 'budget', 'path_topk', 'node_marginal', "
-                f"'soft_topk', 'sample_minpq', 'sample_anyk', "
+                f"'soft_topk', 'sample_minpq', 'sample_rsd', "
+                f"'sample_rsd_offline', 'sample_anyk', "
                 f"'sample_cover', or 'wsoft', got {eal_mode}")
-        return {
+        out = {
             "kl": kl,
             "eal": eal,
             "eal_loss": eal_loss,
@@ -1672,6 +2146,14 @@ class SmallLMTreeV2Model(nn.Module):
                          else None),
             "path_stats": path_stats if eal_mode == "top4_kl_eal" else None,
         }
+        if eal_mode == "sample_rsd":
+            bank = getattr(self, "_srsd_tgt_bank", None)
+            out["tgt_cache_hit_rate"] = (
+                float(bank.hit_rate) if bank is not None else 0.0)
+            out["tgt_cache_size"] = float(len(bank) if bank is not None else 0)
+            out["tgt_cache_skipped"] = float(
+                getattr(self, "_srsd_cache_skipped", 0.0))
+        return out
 
     @torch.no_grad()
     def _exact_batching(self):
@@ -1723,6 +2205,7 @@ class SmallLMTreeV2Model(nn.Module):
                        path_margin, fast, n_tree, offs, Lm):
         gamma, top_k = self.gamma, self.top_k_per_depth
         dev = drf_hidden.device
+        dm = getattr(self, "_expand_model", None) or self.draft_model
         for c in range(0, len(rows), chunk):
             b_t, a_t = rows_t[c:c + chunk], cols_t[c:c + chunk]
             C = a_t.numel()
@@ -1733,15 +2216,15 @@ class SmallLMTreeV2Model(nn.Module):
             else:
                 cache, max_kv = _pad_cache_batch(
                     drf_keys, drf_values, rows[c:c + chunk], kv_lens)
-            lp = F.log_softmax(self.draft_model.lm_head(drf_hidden[b_t, a_t]).float(), -1)
+            lp = F.log_softmax(dm.lm_head(drf_hidden[b_t, a_t]).float(), -1)
             sc, tok = lp.topk(top_k[0], dim=-1)
             toks = [tok]
             for d in range(1, gamma):
                 n_in = toks[-1].size(1)
-                out = self.draft_model(
+                out = dm(
                     input_ids=toks[-1],
                     attention_mask=self._draft_step_mask_batch(
-                        d, kv_lens, max_kv, dev, self.draft_model.dtype),
+                        d, kv_lens, max_kv, dev, dm.dtype),
                     position_ids=(a_t + d).view(C, 1).expand(C, n_in),
                     past_key_values=cache, use_cache=(d < gamma - 1),
                     return_dict=True)
@@ -1834,6 +2317,32 @@ class SmallLMTreeV2Model(nn.Module):
                 n, n_path, path_margin)
         self._exact_rounds = 1
         self._exact_segment = None
+        if max(top_k) == 1 and random_frac <= 0:
+            # Chain: the single kept path follows the sequence while it is
+            # accepted, so every position's accept length is exact from the
+            # teacher-forced draft argmax and nothing is expanded.
+            hit = torch.cat([self.draft_model.lm_head(drf_hidden[:, s:min(Lm, s + 256)]).argmax(-1)
+                             == u[:, s:s + 256] for s in range(0, Lm, 256)], 1) & mask
+            hp = F.pad(hit, (0, gamma))
+            win = torch.stack([hp[:, j:j + Lm] for j in range(gamma)], -1)
+            m = win.long().cumprod(-1).sum(-1)
+            n.copy_(m.float())
+            n_path[:, :, 0] = m
+            path_margin.fill_(float("inf"))
+            n_c, mask_c = m.cpu().numpy(), mask.cpu().numpy()
+            start = torch.zeros(B, Lm, dtype=torch.bool)
+            for b in range(B):
+                v = mask_c[b].nonzero()[0]
+                if v.size == 0:
+                    continue
+                s, end = int(v[0]), int(v[-1]) + 1
+                while s < end:
+                    start[b, s] = bool(mask_c[b, s])
+                    s += int(n_c[b, s]) + 1
+            self._exact_known = mask.clone()
+            self._exact_path_n = n_path
+            self._exact_path_margin = path_margin
+            return start.to(dev), n
         if random_frac > 0:
             pick = torch.zeros(B, Lm, dtype=torch.bool, device=dev)
             for b in range(B):
@@ -1938,6 +2447,103 @@ class SmallLMTreeV2Model(nn.Module):
         self._exact_path_margin = path_margin
         return _walk_windows(n, mask), n
 
+    def init_gto_ref(self, draft_path, dtype):
+        """Frozen copy of the initial draft: GTO's reference policy."""
+        self.ref_draft = AutoModelForCausalLM.from_pretrained(
+            draft_path, torch_dtype=dtype, attn_implementation="sdpa")
+        for p in self.ref_draft.parameters():
+            p.requires_grad = False
+        self.ref_draft.eval()
+
+    def _gto_loss(self, input_ids, attention_mask, loss_mask, drf_hidden,
+                  drf_keys, drf_values, tgt_hidden, path_topk, n_groups=2,
+                  group_len=4, eps=0.2):
+        """Group Tree Optimization (Hu et al. 2025) on the teacher-forced
+        sequence. Per sequence, n_groups random non-overlapping runs of
+        group_len supervised positions; at each position the draft tree of the
+        current and of the reference draft is expanded, the reward is the
+        difference of their log-sum-exp aggregated kept-path accept lengths,
+        and the policy log-prob is that of the best current path's accepted
+        (gold) tokens. PPO-clipped objective with group-normalized advantages
+        and ratios against the frozen reference."""
+        import random
+        mask = loss_mask[:, 1:].bool()
+        B, Lm = mask.shape
+        dev = drf_hidden.device
+        mask_c = mask.cpu().numpy()
+        groups = []
+        for b in range(B):
+            ok = [i for i in range(Lm - group_len + 1) if mask_c[b, i:i + group_len].all()]
+            random.shuffle(ok)
+            chosen = []
+            for i in ok:
+                if all(abs(i - j) >= group_len for j in chosen):
+                    chosen.append(i)
+                if len(chosen) == n_groups:
+                    break
+            groups += [(b, i) for i in chosen]
+        zero = drf_hidden.sum() * 0.0
+        if not groups:
+            return zero, 0.0
+        rows = [b for b, i in groups for _ in range(group_len)]
+        cols = [i + j for b, i in groups for j in range(group_len)]
+        with torch.no_grad():
+            u = torch.cat([self.target_model.lm_head(tgt_hidden[:, s:s + 256]).argmax(-1)
+                           for s in range(0, Lm, 256)], 1)[:, :Lm]
+            ref_out = self.ref_draft.model(input_ids=input_ids, attention_mask=attention_mask,
+                                           use_cache=True, return_dict=True)
+            ref_hidden = ref_out.last_hidden_state
+            ref_keys, ref_values = _extract_kv_lists(ref_out.past_key_values)
+            del ref_out
+            res = {}
+            for tag, hid, ks, vs, model in (
+                    ("cur", drf_hidden.detach(), drf_keys, drf_values, None),
+                    ("ref", ref_hidden, ref_keys, ref_values, self.ref_draft)):
+                n = torch.zeros(B, Lm, device=dev)
+                n_path = torch.zeros(B, Lm, int(path_topk), device=dev, dtype=torch.long)
+                margin = torch.full((B, Lm, self.gamma), float("nan"), device=dev)
+                self._expand_model = model
+                try:
+                    self._expand_positions(rows, cols, hid, ks, vs, u, mask, path_topk,
+                                           64, n, n_path, margin)
+                finally:
+                    self._expand_model = None
+                res[tag] = n_path
+            r_t = torch.as_tensor(rows, device=dev)
+            c_t = torch.as_tensor(cols, device=dev)
+            m_cur = res["cur"][r_t, c_t].float()                     # [N, k]
+            m_ref = res["ref"][r_t, c_t].float()
+            reward = torch.logsumexp(m_cur, -1) - torch.logsumexp(m_ref, -1)
+            acc = m_cur.max(-1).values.long()                         # [N]
+        offs = torch.arange(self.gamma, device=dev)
+        p = (c_t.view(-1, 1) + offs).clamp(max=Lm - 1)
+        bb = r_t.view(-1, 1).expand_as(p)
+        live = (offs.view(1, -1) < acc.view(-1, 1)).float()
+        tok = u[bb, p]
+
+        def seq_logp(head, hid):
+            lq = F.log_softmax(head(hid[bb, p]).float(), -1)
+            return (lq.gather(-1, tok.unsqueeze(-1)).squeeze(-1) * live).sum(-1)
+
+        logp = seq_logp(self.draft_model.lm_head, drf_hidden)
+        with torch.no_grad():
+            logp_ref = seq_logp(self.ref_draft.lm_head, ref_hidden)
+        losses, rewards = [], []
+        for g in range(len(groups)):
+            sl = slice(g * group_len, (g + 1) * group_len)
+            keep = acc[sl] >= 1
+            if int(keep.sum()) < 2:
+                continue
+            rw = reward[sl][keep]
+            adv = ((rw - rw.mean()) / (rw.std() + 1e-6)).clamp(-5.0, 5.0)
+            ratio = torch.exp((logp[sl][keep] - logp_ref[sl][keep]).clamp(-10.0, 10.0)).clamp(0.1, 10.0)
+            obj = torch.min(ratio * adv, ratio.clamp(1 - eps, 1 + eps) * adv)
+            losses.append(-obj.mean())
+            rewards.append(rw.mean())
+        if not losses:
+            return zero, 0.0
+        return torch.stack(losses).mean(), float(torch.stack(rewards).mean())
+
     def _eal_gradnorm_coef(self, kl_part, eal_loss, ratio):
         """EAL coefficient that makes its gradient `ratio` times as long as the
         KL gradient. The norms are measured every `eal_gn_every` calls on the
@@ -1958,11 +2564,242 @@ class SmallLMTreeV2Model(nn.Module):
             self._eal_gn_norms = (n_kl, n_eal)
         return self._eal_gn_coef
 
+    def _forward_srsd_offline(self, input_ids, attention_mask, loss_mask,
+                              cache_tokens, cache_parents, cache_tgt_node,
+                              cache_valid, cache_path_tokens, cache_path_nodes,
+                              anchor_pos, path_topk=4, anchor_kl_coef=1.0,
+                              eal_aux_coef=1.0, temperature=1.0):
+        """Offline Sampled-tree EAL with match / discard against a path bank.
+
+        Draft samples a fresh tree and keeps ``path_topk`` draft-score paths.
+        Each path is kept only if its token sequence equals a cached
+        target-verified path; unmatched paths are discarded. Cached target
+        logits supervise the matched union; training never runs the target.
+        """
+        device = input_ids.device
+        B = input_ids.size(0)
+        T = max(float(temperature), 1e-6)
+        gamma = self.gamma
+        top_k = self.top_k_per_depth
+        depth_counts = self.tree_depth_counts
+        a_t = anchor_pos.to(device=device, dtype=torch.long)
+        kv_lens = (a_t + 1).tolist()
+
+        drf_out = self.draft_model.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            use_cache=True, return_dict=True)
+        drf_hidden = drf_out.last_hidden_state
+        drf_keys, drf_values = _extract_kv_lists(drf_out.past_key_values)
+        del drf_out
+        drf_root = self.draft_model.lm_head(
+            drf_hidden[torch.arange(B, device=device), a_t]).float()
+        drf_cache, max_kv = _pad_cache_batch(
+            drf_keys, drf_values, list(range(B)), kv_lens)
+
+        # --- draft Expand (same as online sample_rsd) ---
+        root_lp = F.log_softmax(drf_root, dim=-1)
+        with torch.no_grad():
+            root_tok = torch.multinomial(
+                torch.softmax(drf_root / T, dim=-1), top_k[0], replacement=False)
+        root_scores = root_lp.gather(-1, root_tok)
+        tokens_per_depth = [root_tok]
+        scores_per_depth = [root_scores]
+        pred_per_depth = [
+            drf_root.unsqueeze(1).expand(B, top_k[0], -1).contiguous()]
+        full_leaf_sc = root_scores if gamma == 1 else None
+
+        for d_step in range(1, gamma):
+            n_in = tokens_per_depth[-1].size(1)
+            if n_in != depth_counts[d_step - 1]:
+                raise RuntimeError(
+                    "offline sample_rsd needs the full tree "
+                    f"(depth {d_step - 1}: {n_in} != {depth_counts[d_step - 1]})")
+            mask = self._draft_step_mask_batch(
+                d_step, kv_lens, max_kv, device, self.draft_model.dtype)
+            pos = (a_t + d_step).view(B, 1).expand(B, n_in)
+            step_out = self.draft_model(
+                input_ids=tokens_per_depth[-1],
+                attention_mask=mask, position_ids=pos,
+                past_key_values=drf_cache,
+                use_cache=(d_step < gamma - 1), return_dict=True)
+            depth_pred = step_out.logits.float()
+            child_lp = F.log_softmax(depth_pred, dim=-1)
+            k = top_k[d_step]
+            with torch.no_grad():
+                flat_p = torch.softmax(depth_pred / T, dim=-1).reshape(B * n_in, -1)
+                child_tok = torch.multinomial(
+                    flat_p, k, replacement=False).view(B, n_in, k)
+            child_sc = child_lp.gather(-1, child_tok)
+            cum = scores_per_depth[-1].unsqueeze(-1) + child_sc
+            flat_tok = child_tok.reshape(B, -1)
+            flat_sc = cum.reshape(B, -1)
+            flat_pred = depth_pred.repeat_interleave(k, dim=1)
+            if d_step == gamma - 1:
+                full_leaf_sc = flat_sc
+            tokens_per_depth.append(flat_tok)
+            scores_per_depth.append(flat_sc)
+            pred_per_depth.append(flat_pred)
+            if d_step < gamma - 1:
+                drf_cache = step_out.past_key_values
+
+        tokens = torch.cat(tokens_per_depth, dim=1)
+        drf_node = torch.cat(pred_per_depth, dim=1)
+
+        # --- Score → keep path_topk draft paths → match against cache bank ---
+        k_paths = min(int(path_topk), int(full_leaf_sc.size(1)))
+        if k_paths <= 0:
+            raise RuntimeError("sample_rsd_offline requires --path_topk > 0")
+        draft_sel = full_leaf_sc.detach().topk(k_paths, dim=-1).indices  # [B, K]
+        path_tpl = self.paths.to(device)  # [n_paths, gamma]
+        draft_nodes = path_tpl[draft_sel]  # [B, K, gamma]
+        draft_pt = tokens.gather(
+            1, draft_nodes.reshape(B, -1)).view(B, k_paths, gamma)
+
+        cache_pt = cache_path_tokens.to(device=device, dtype=torch.long)  # [B, P, gamma]
+        cache_pn = cache_path_nodes.to(device=device, dtype=torch.long)   # [B, P, gamma]
+        cache_tgt = cache_tgt_node.to(device=device, dtype=torch.float32)  # [B, M, V]
+        cache_tok = cache_tokens.to(device=device, dtype=torch.long)
+        cache_ok = cache_valid.to(device=device, dtype=torch.bool)
+        _ = cache_parents  # topology only needed inside the cache bank itself
+
+        # match[b,k,p] = draft path k equals cached path p
+        match = (draft_pt.unsqueeze(2) == cache_pt.unsqueeze(1)).all(dim=-1)  # [B,K,P]
+        matched_any = match.any(dim=-1)  # [B, K]
+        match_p = match.long().argmax(dim=-1)  # [B, K] (0 if none; gated by matched_any)
+
+        matched_sel = torch.full(
+            (B, k_paths), -1, device=device, dtype=torch.long)
+        n_matched = torch.zeros(B, device=device, dtype=torch.long)
+        for b in range(B):
+            keep = matched_any[b].nonzero(as_tuple=True)[0]
+            n = int(keep.numel())
+            n_matched[b] = n
+            if n:
+                matched_sel[b, :n] = draft_sel[b, keep]
+
+        if int(n_matched.sum().item()) == 0:
+            zero = drf_root.sum() * 0.0
+            metrics = {
+                "total_loss": 0.0, "kl_loss": 0.0, "aux_loss": 0.0,
+                "eal_mean": 0.0, "eal_loss": 0.0, "dense_loss": 0.0,
+                "num_anchors": B, "num_valid": 0.0, "mean_tau": 0.0,
+                "eagle_loss": 0.0, "tree_nodes": 0.0,
+                "match_rate": 0.0, "n_matched_paths": 0.0,
+            }
+            return zero, zero.detach(), metrics
+
+        # Pad sel with a repeated valid path index so induce still runs; mask later.
+        Kmax = max(int(n_matched.max().item()), 1)
+        sel_padded = matched_sel[:, :Kmax].clone()
+        for b in range(B):
+            n = int(n_matched[b].item())
+            if n == 0:
+                sel_padded[b, :] = 0
+            elif n < Kmax:
+                sel_padded[b, n:] = sel_padded[b, 0]
+
+        union_parents, gather_index = induce_path_indices_union(
+            self.tree_parents, self.paths, sel_padded)
+        M = gather_index.size(1)
+        valid_u = gather_index >= 0
+        for b in range(B):
+            if int(n_matched[b].item()) == 0:
+                valid_u[b] = False
+                gather_index[b] = -1
+        gi = gather_index.clamp(min=0)
+        tok_u = torch.where(valid_u, tokens.gather(1, gi), torch.zeros_like(gi))
+        drf_u = drf_node.gather(
+            1, gi.unsqueeze(-1).expand(B, M, drf_node.size(-1)))
+
+        # Target logits from cache via matched path coverage.
+        V = cache_tgt.size(-1)
+        tgt_u = drf_u.new_zeros(B, M, V)
+        for b in range(B):
+            if int(n_matched[b].item()) == 0:
+                continue
+            live_to_tgt = {}
+            keep = matched_any[b].nonzero(as_tuple=True)[0]
+            for ki in keep.tolist():
+                p = int(match_p[b, ki].item())
+                for d in range(gamma):
+                    live_n = int(draft_nodes[b, ki, d].item())
+                    c_n = int(cache_pn[b, p, d].item())
+                    if c_n < 0 or not bool(cache_ok[b, c_n]):
+                        continue
+                    live_to_tgt[live_n] = c_n
+            for j in range(M):
+                if not bool(valid_u[b, j]):
+                    continue
+                live_n = int(gather_index[b, j].item())
+                c_n = live_to_tgt.get(live_n, None)
+                if c_n is None:
+                    valid_u[b, j] = False
+                    continue
+                tgt_u[b, j] = cache_tgt[b, c_n]
+                if int(cache_tok[b, c_n].item()) != int(tok_u[b, j].item()):
+                    valid_u[b, j] = False
+
+        node_mask = valid_u
+        row_ok = node_mask.any(dim=-1)
+        slot = union_parents + 1
+        n_sib = torch.zeros(B, M + 1, device=device).scatter_add_(
+            1, slot, node_mask.float())
+        w_kl = node_mask.float() / n_sib.gather(1, slot).clamp(min=1.0)
+        w_kl = w_kl * row_ok.float().unsqueeze(-1)
+        tgt_logp = F.log_softmax(tgt_u, dim=-1)
+        kl_node = (tgt_logp.exp() * (
+            tgt_logp - F.log_softmax(drf_u, dim=-1))).sum(-1).clamp(min=0.0)
+        kl = (kl_node * w_kl).sum() / w_kl.sum().clamp(min=1.0)
+
+        eal_cond, _ = sampled_tree_rsd_eal(
+            tok_u, tgt_u, drf_u, union_parents, temperature=T, node_mask=node_mask)
+        eal_cond = torch.where(row_ok, eal_cond, torch.zeros_like(eal_cond))
+        if bool(row_ok.any()):
+            eal_loss = -eal_cond[row_ok].mean()
+        else:
+            eal_loss = drf_root.sum() * 0.0
+        total_loss = (anchor_kl_coef * kl + eal_aux_coef * eal_loss
+                      + drf_root.sum() * 0.0)
+
+        match_rate = float(n_matched.float().mean().item()) / float(k_paths)
+        metrics = {
+            "total_loss": float(total_loss.detach()),
+            "kl_loss": float(kl.detach()),
+            "aux_loss": float(eal_loss.detach()),
+            "eal_mean": float(eal_cond[row_ok].mean().detach()) if bool(row_ok.any()) else 0.0,
+            "eal_loss": float(eal_loss.detach()),
+            "dense_loss": 0.0,
+            "num_anchors": B,
+            "num_valid": float(row_ok.float().sum().item()),
+            "mean_tau": float(eal_cond[row_ok].mean().detach()) if bool(row_ok.any()) else 0.0,
+            "eagle_loss": float(kl.detach()),
+            "tree_nodes": float(node_mask.float().sum(dim=-1)[row_ok].mean().item())
+                          if bool(row_ok.any()) else 0.0,
+            "match_rate": match_rate,
+            "n_matched_paths": float(n_matched.float().mean().item()),
+        }
+        return total_loss, total_loss.detach(), metrics
+
     def forward(self, input_ids, attention_mask, loss_mask,
                 anchor_kl_coef=1.0, eal_aux_coef=0.1, temperature=1.0,
                 eal_mode="budget", path_topk=16, n_anchors=1, n_draws=1,
                 eal_score_coef=0.1, path_eal_weights=None,
                 path_eal_mean=False, path_eal_var_coef=0.0, **kwargs):
+        if eal_mode == "sample_rsd_offline":
+            return self._forward_srsd_offline(
+                input_ids, attention_mask, loss_mask,
+                cache_tokens=kwargs["srsd_tokens"],
+                cache_parents=kwargs["srsd_parents"],
+                cache_tgt_node=kwargs["srsd_tgt_node"],
+                cache_valid=kwargs["srsd_valid"],
+                cache_path_tokens=kwargs["srsd_path_tokens"],
+                cache_path_nodes=kwargs["srsd_path_nodes"],
+                anchor_pos=kwargs["srsd_anchor_pos"],
+                path_topk=path_topk,
+                anchor_kl_coef=anchor_kl_coef,
+                eal_aux_coef=eal_aux_coef,
+                temperature=temperature,
+            )
         B, L = input_ids.shape
         device = input_ids.device
 
@@ -1976,6 +2813,20 @@ class SmallLMTreeV2Model(nn.Module):
         # draft entropy instead of steering the sampling.
         n_anchors = max(int(n_anchors), 1)
         n_draws = max(int(n_draws), 1)
+        # sample_rsd / sample_anyk score-function needs >=2 draws per anchor;
+        # with n_draws=1 the within-anchor advantage is identically zero.
+        # reinforce mode always needs a within-anchor baseline.
+        _srsd_gm = str(getattr(self, "srsd_grad_mode", "pq_ratio"))
+        need_score_baseline = (
+            (eal_mode in ("sample_rsd", "sample_anyk") and float(eal_score_coef) != 0.0)
+            or (eal_mode == "sample_rsd"
+                and _srsd_gm in ("reinforce", "minpq_reinforce")))
+        if need_score_baseline:
+            # reinforce / hybrid: prefer >=4 draws for a stabler baseline.
+            floor = (4 if (eal_mode == "sample_rsd"
+                           and _srsd_gm in ("reinforce", "minpq_reinforce"))
+                     else 2)
+            n_draws = max(n_draws, floor)
         batch_idx = []
         anchor_pos = []
         anchor_group = []
@@ -2099,20 +2950,42 @@ class SmallLMTreeV2Model(nn.Module):
                     exact_mask.float().sum() / loss_mask[:, 1:].float().sum(),
                     exact_n.new_tensor(float(self._exact_rounds))])
             top4_start = exact is not None and getattr(self, "top4_start_eal", False)
+            eal_starts, eal_path_n = exact, getattr(self, "_exact_path_n", None)
+            all_starts = top4_start and getattr(self, "eal_all_starts", False)
+            if all_starts:
+                eal_starts = loss_mask[:, 1:].bool()
+                eal_path_n = torch.full_like(self._exact_path_n, self.gamma - 1)
             d_kl, d_eal, d_var, d_hard = dense_tree_loss(
                 drf_hidden, tgt_hidden, self.draft_model.lm_head,
                 self.target_model.lm_head, loss_mask, list(self.top_k_per_depth),
                 tau=float(getattr(self, "greedy_tau", 1.0)),
                 var_coef=path_eal_var_coef,
                 start_only=bool(getattr(self, "dense_eal_start", False)),
-                starts=exact,
-                path_n=self._exact_path_n if top4_start else None,
+                starts=eal_starts,
+                path_n=eal_path_n if top4_start else None,
                 temp=temperature,
-                prob_starts=top4_start and getattr(self, "prob_starts", False),
+                prob_starts=(top4_start and not all_starts
+                             and getattr(self, "prob_starts", False)),
                 path_margin=self._exact_path_margin if top4_start else None,
                 prob_region=(self._exact_known if top4_start
                              and self._exact_segment is not None else None),
-                eal_region=self._exact_segment if top4_start else None)
+                eal_region=self._exact_segment if top4_start else None,
+                boundary_tau=(float(getattr(self, "boundary_tau", 0.0))
+                              if top4_start and not all_starts else 0.0),
+                path_agg=str(getattr(self, "eal_path_agg", "mean")),
+                eal_alpha=float(getattr(self, "eal_alpha", 0.0)))
+            dpace_alpha = float(getattr(self, "dpace_alpha", -1.0))
+            d_pace = None
+            if dpace_alpha >= 0:
+                d_pace = dpace_loss(drf_hidden, tgt_hidden, self.draft_model.lm_head,
+                                    self.target_model.lm_head, loss_mask, self.gamma,
+                                    dpace_alpha)
+            gto_coef = float(getattr(self, "gto_coef", 0.0))
+            gto_loss, gto_reward = None, 0.0
+            if gto_coef > 0 and self.training:
+                gto_loss, gto_reward = self._gto_loss(
+                    input_ids, attention_mask, loss_mask, drf_hidden, drf_keys,
+                    drf_values, tgt_hidden, path_topk)
             del tgt_hidden
         elif top4_dense_kl:
             d_kl = dense_tree_loss(
@@ -2121,6 +2994,18 @@ class SmallLMTreeV2Model(nn.Module):
                 tau=1.0)[0]
             del tgt_hidden
         del drf_hidden
+
+        # Context keys for the online target path bank (sample_rsd).
+        if eal_mode == "sample_rsd" and bool(getattr(self, "srsd_tgt_cache", False)):
+            try:
+                from sdpo.srsd_tgt_cache import ctx_key_from_prefix
+            except ImportError:
+                from srsd_tgt_cache import ctx_key_from_prefix
+            self._srsd_ctx_keys = [
+                ctx_key_from_prefix(input_ids[b], ap)
+                for b, ap in zip(batch_idx, anchor_pos)]
+        else:
+            self._srsd_ctx_keys = None
 
         out = self._rollout_batch(
             batch_idx, anchor_pos, drf_anchor, tgt_anchor,
@@ -2131,14 +3016,25 @@ class SmallLMTreeV2Model(nn.Module):
             path_eal_mean=path_eal_mean, path_eal_var_coef=path_eal_var_coef,
             tree_kl_w=tree_kl_w, tree_eal_w=tree_eal_w)
 
-        if eal_mode in ("node_marginal", "soft_topk", "sample_minpq",
-                        "sample_anyk", "sample_cover", "wsoft", "greedy_topk"):
+        if eal_mode in ("node_marginal", "sample_anyk", "sample_cover",
+                        "wsoft", "greedy_topk"):
             total_loss = out["eal_loss"]
             if dense_loss is not None:
                 total_loss = total_loss + dense_loss
-        elif eal_mode == "top4_kl_eal":
+        elif eal_mode in ("soft_topk", "sample_minpq"):
+            # Dense tree EAL (+ optional path/union KL). soft_topk previously
+            # dropped anchor_kl_coef entirely; wire it like sample_rsd.
+            total_loss = (float(eal_aux_coef) * out["eal_loss"]
+                          + float(anchor_kl_coef) * out["kl"])
+            if dense_loss is not None:
+                total_loss = total_loss + dense_loss
+        elif eal_mode == "sample_rsd":
+            # Match sample_anyk: EAL (+ score) is primary; KL optional via coef.
+            total_loss = (float(eal_aux_coef) * out["eal_loss"]
+                          + float(anchor_kl_coef) * out["kl"])
+        elif eal_mode in ("top4_kl_eal", "sample_rsd_offline"):
             kl_part = anchor_kl_coef * out["kl"]
-            if top4_dense_kl:
+            if eal_mode == "top4_kl_eal" and top4_dense_kl:
                 dense_loss = d_kl
                 kl_part = kl_part + d_kl
             eal_coef = eal_aux_coef
@@ -2148,18 +3044,21 @@ class SmallLMTreeV2Model(nn.Module):
             total_loss = kl_part + eal_coef * out["eal_loss"]
             if getattr(self, "keep_parts", False):
                 self.last_parts = {"top4_kl": out["kl"], "eal_loss": out["eal_loss"],
-                                   "dense_kl": d_kl if top4_dense_kl else None}
+                                   "dense_kl": (d_kl if eal_mode == "top4_kl_eal"
+                                                and top4_dense_kl else None)}
         elif eal_mode == "dense_tree":
             # dense KL + anchor_kl_coef * rollout-node KL
             #   - eal_aux_coef * (dense tree E[L] - var_coef * Var_windows E[L])
             out["eal_loss"] = -(d_eal - float(path_eal_var_coef) * d_var)
-            dense_loss = d_kl
-            kl_part = d_kl + anchor_kl_coef * out["kl"]
+            dense_loss = d_kl if d_pace is None else d_pace
+            kl_part = dense_loss + anchor_kl_coef * out["kl"]
             eal_coef = eal_aux_coef
             gn_ratio = float(getattr(self, "eal_gn_ratio", 0.0))
             if gn_ratio > 0 and self.training and torch.is_grad_enabled():
                 eal_coef = self._eal_gradnorm_coef(kl_part, out["eal_loss"], gn_ratio)
             total_loss = kl_part + eal_coef * out["eal_loss"]
+            if gto_loss is not None:
+                total_loss = total_loss + gto_coef * gto_loss
         else:
             total_loss = anchor_kl_coef * out["kl"] - eal_aux_coef * out["eal"]
         eal_loss_value = (out["eal_loss"] if out["eal_loss"] is not None
@@ -2186,6 +3085,9 @@ class SmallLMTreeV2Model(nn.Module):
         }
         if out.get("path_std") is not None:
             metrics["path_eal_std"] = float(out["path_std"])
+        for key in ("tgt_cache_hit_rate", "tgt_cache_size", "tgt_cache_skipped"):
+            if key in out:
+                metrics[key] = out[key]
         if out.get("path_stats") is not None:
             stats = out["path_stats"].float().tolist()
             k = (len(stats) - 2) // 2
@@ -2199,6 +3101,9 @@ class SmallLMTreeV2Model(nn.Module):
         if eal_mode == "dense_tree":
             metrics["dense_eal"], metrics["dense_var"], metrics["dense_hard_al"] = (
                 torch.stack([d_eal.detach(), d_var.detach(), d_hard]).float().tolist())
+            metrics["dense_kl"] = float(d_kl.detach())
+            if gto_loss is not None:
+                metrics["gto_loss"], metrics["gto_reward"] = float(gto_loss.detach()), gto_reward
             if exact is not None:
                 (metrics["windows_per_seq"], metrics["exact_al_at_starts"],
                  metrics["exact_al_all_pos"], metrics["exact_expanded_frac"],

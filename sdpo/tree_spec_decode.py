@@ -1081,6 +1081,7 @@ def build_draft_tree_incremental(
     temperature: float = 1.0,
     need_probs: bool = False,
     draft_top_k_vocab: int = 0,
+    keep_dists: bool = False,
 ) -> Tuple[DraftTree, float]:
     """Build a draft tree with PERSISTENT draft KV cache.
 
@@ -1091,6 +1092,9 @@ def build_draft_tree_incremental(
     need_probs:
       If True, also records p_draft(token | parent) per node into tree.probs.
       Required for ratio verify ('ratio' verify_mode).
+    keep_dists:
+      If True, also stores full parent-slot draft distributions and per-node
+      multinomial ranks for residual sibling verify ('rsd').
     """
     """Build a draft tree with PERSISTENT draft KV cache.
 
@@ -1128,6 +1132,8 @@ def build_draft_tree_incremental(
     node_depths = []
     node_scores = []
     node_probs = []   # p_draft per node (1.0 placeholder when not needed)
+    node_ranks = []   # multinomial draw order among siblings
+    parent_dists = {}  # parent idx (-1 = pending) -> (probs tensor, row)
     depth_counts = []
     T_draft = max(temperature, 1e-6)
 
@@ -1167,6 +1173,8 @@ def build_draft_tree_incremental(
                 log_probs_full = F.log_softmax(last_logits / T_draft, dim=-1)
                 roots_sc = log_probs_full[0, sampled].tolist()
             roots_tok = sampled.tolist()
+            if keep_dists:
+                parent_dists[-1] = (probs_root, 0)
         else:
             log_probs = F.log_softmax(last_logits, dim=-1)
             topk_s, topk_i = log_probs.topk(n_roots, dim=-1)
@@ -1183,6 +1191,7 @@ def build_draft_tree_incremental(
             node_depths.append(0)
             node_scores.append(roots_sc[r])
             node_probs.append(p_at[r])
+            node_ranks.append(r)
         depth_counts.append(n_roots)
 
         # Depth 1..gamma: forward depth-(d-1) leaves. At depth == gamma we only
@@ -1257,6 +1266,9 @@ def build_draft_tree_incremental(
                     topk_i = sampled
                     topk_s = (new_lp.gather(1, sampled))
                     cand_probs = probs_leaves.gather(1, sampled)
+                if keep_dists:
+                    for li, leaf_idx in enumerate(leaf_indices):
+                        parent_dists[leaf_idx] = (probs_leaves, li)
             else:
                 topk_s, topk_i = new_lp.topk(k_this, dim=-1)
                 if need_probs:
@@ -1290,12 +1302,14 @@ def build_draft_tree_incremental(
             sel_p = sel_parents.tolist()
             sel_s = top_vals.tolist()
             sel_pr = sel_probs.tolist()
+            sel_rank = (top_idx % k_this).tolist()
             for i in range(keep):
                 node_tokens.append(sel_t[i])
                 node_parents.append(sel_p[i])
                 node_depths.append(depth)
                 node_scores.append(sel_s[i])
                 node_probs.append(sel_pr[i])
+                node_ranks.append(sel_rank[i])
             depth_counts.append(keep)
 
     draft_time = time.time() - t0
@@ -1312,6 +1326,8 @@ def build_draft_tree_incremental(
         depth_counts=depth_counts,
         device=device,
     )
+    tree.ranks = node_ranks
+    tree.dists = parent_dists if keep_dists else None
     return tree, draft_time
 
 
@@ -1331,6 +1347,9 @@ def verify_tree_step(
       'simple' — r ≤ p_target(token)
       'ratio'  — r ≤ p_target(token) / p_draft(token)  (exact rejection sampling).
                  Requires tree.probs (build with need_probs=True or draft_mode='sample').
+      'rsd'    — lossless residual sibling verify: test siblings in draft-sample
+                 order; after rejecting x, p <- norm(max(p-q,0)) and q drops x.
+                 Requires tree.dists/ranks (build with keep_dists=True).
 
     Input  = [pending, tree.tokens], length n+1.
     Output new_tokens = [accepted_path] ++ [correction], length n_acc+1.
@@ -1449,7 +1468,67 @@ def verify_tree_step(
     if eff_verify == 'auto':
         eff_verify = 'greedy' if temperature == 0.0 else 'simple'
 
-    if eff_verify in ('simple', 'ratio', 'ratio_fix', 'exclusive'):
+    if eff_verify == 'rsd':
+        # Lossless residual sibling verification matching Sampled-tree EAL.
+        # When path_topk>0, only residual-test nodes on the kept top-k paths
+        # (same pruned union as sample_rsd training). Off-union siblings are
+        # treated as never drafted — they do not consume residual mass.
+        T_v = max(temperature, 1e-6)
+        probs = torch.softmax(logits / T_v, dim=-1)
+        children = [[] for _ in range(n)]
+        roots = []
+        for i in range(n):
+            p = parents_cpu[i]
+            if p < 0:
+                roots.append(i)
+            else:
+                children[p].append(i)
+        keep = None
+        if path_topk and path_topk > 0:
+            keep = set()
+            for path in paths:
+                keep.update(path)
+            roots = [i for i in roots if i in keep]
+            for p in range(n):
+                if children[p]:
+                    children[p] = [i for i in children[p] if i in keep]
+        ranks = getattr(tree, 'ranks', None) or list(range(n))
+        dists = getattr(tree, 'dists', None)
+        if dists is None:
+            raise RuntimeError("verify_mode='rsd' requires keep_dists=True when building the tree")
+        cur, best_path = -1, []
+        while True:
+            kids = roots if cur < 0 else children[cur]
+            slot = 0 if cur < 0 else 1 + cur
+            p = probs[slot].clone()
+            acc = None
+            if kids:
+                dt, row = dists[cur]
+                q = dt[row].float().clone()
+                for i in sorted(kids, key=lambda c: ranks[c]):
+                    x = tree_tokens_cpu[i]
+                    if random.random() <= min(1.0, p[x].item() / max(q[x].item(), 1e-20)):
+                        acc = i
+                        break
+                    r = torch.clamp(p - q, min=0)
+                    s = r.sum()
+                    p = r / s if s > 0 else p
+                    q = q.clone()
+                    q[x] = 0
+                    qs = q.sum()
+                    if qs > 0:
+                        q = q / qs
+            if acc is None:
+                correction = torch.multinomial(p, 1).view(1, 1)
+                break
+            best_path.append(acc)
+            cur = acc
+        best_accepted = len(best_path)
+        if best_accepted > 0:
+            accepted_toks = tree.tokens[best_path].unsqueeze(0)
+        else:
+            accepted_toks = torch.empty(1, 0, dtype=torch.long, device=device)
+    elif eff_verify in ('simple', 'ratio', 'ratio_fix', 'exclusive'):
         T_v = max(temperature, 1e-6)
         probs = torch.softmax(logits / T_v, dim=-1)
         if target_top_k > 0:

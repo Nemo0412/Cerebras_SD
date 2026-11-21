@@ -65,7 +65,9 @@ parser.add_argument('--temperature', type=float, default=1.0,
                          'probabilities. Draft tree stays greedy top-k.')
 parser.add_argument('--eal_mode', type=str, default='budget',
                     choices=['budget', 'path_topk', 'node_marginal', 'soft_topk',
-                             'sample_minpq', 'sample_anyk', 'sample_cover', 'wsoft',
+                             'sample_minpq', 'sample_rsd', 'sample_rsd_offline',
+                             'sample_anyk',
+                             'sample_cover', 'wsoft',
                              'greedy_topk', 'dense_tree', 'top4_kl_eal'],
                     help='budget: KL minus E[L] on the node-budget tree. '
                          'path_topk: KL minus exact E[L] on the Top-K path union. '
@@ -77,6 +79,19 @@ parser.add_argument('--eal_mode', type=str, default='budget',
                          'loss = -sum over nodes of prod α along the path. '
                          'Logged accept length is one realized eval-rule draw. '
                          'Eval with --draft-mode sample --verify-mode ratio. '
+                         'sample_rsd: online Sampled tree EAL. Draft samples '
+                         'the full tree, keeps --path_topk draft-score paths, '
+                         'target verifies ONLY that pruned union. '
+                         'P(A(v))=P(parent)*prod_{u before v}(1-a(u))*a(v), '
+                         'a=min(1,u/q); after reject u<-norm(max(u-q,0)) and '
+                         'q drops v. E[L]=sum_v P(A(v)). '
+                         'loss = anchor_kl_coef*KL + eal_aux_coef*(-E[L]). '
+                         'Eval with --draft-mode sample --verify-mode rsd. '
+                         'sample_rsd_offline: draft resamples a tree and keeps '
+                         '--path_topk paths; a path is used only if its token '
+                         'sequence matches a cached target-verified path from '
+                         '--srsd_cache, else discarded. Training never runs '
+                         'the target. '
                          'sample_anyk: same sampled tree, but scored with the '
                          'rule eval runs: each node accepted with min(1, p/q) '
                          'and a slot advances if ANY sibling is accepted. Adds '
@@ -122,18 +137,44 @@ parser.add_argument('--soft_target_m', type=int, default=4,
                     help='Target tokens added beside the drafted children in '
                          'eal_mode=wsoft. Tokens already in the draft top-k '
                          'are not added twice.')
-parser.add_argument('--n_draws', type=int, default=1,
-                    help='Independent tree draws per anchor. sample_anyk needs '
-                         '>=2 for its score-function baseline.')
+parser.add_argument('--n_draws', type=int, default=2,
+                    help='Independent tree draws per anchor. sample_anyk / '
+                         'sample_rsd auto-bump to >=2 when eal_score_coef!=0 '
+                         'so the within-anchor score-function baseline is live.')
 parser.add_argument('--eal_score_coef', type=float, default=0.1,
                     help='Weight of the score-function (sampling) term in '
-                         'sample_anyk. 0 keeps only the value term.')
+                         'sample_anyk and sample_rsd. Needs --n_draws>=2 for a '
+                         'non-zero within-anchor baseline (enforced in forward). '
+                         '0 keeps only the value term. For srsd_grad_mode=reinforce '
+                         'this scales adv*logπ (defaulted to 1 if 0).')
+parser.add_argument('--srsd_grad_mode', type=str, default='pq_ratio',
+                    choices=['pq_ratio', 'minpq', 'reinforce', 'minpq_reinforce'],
+                    help='sample_rsd gradient estimator: '
+                         'pq_ratio=live a=min(1,p/q)+mean logq score (legacy); '
+                         'minpq=value via α=min(p,q) path-sum (ALTV-shaped); '
+                         'reinforce=stopgrad RSD E[L] + WoR logπ(τ) '
+                         '(adv clamp±5, |logπ| scale; auto n_draws>=4); '
+                         'minpq_reinforce=dense minpq value + reinforce score.')
 parser.add_argument('--n_anchors', type=int, default=1,
                     help='Trees per sequence per step. >1 raises the supervision '
                          'per sample and gives sample_anyk its baseline.')
 parser.add_argument('--path_topk', type=int, default=16,
                     help='How many paths to keep. Used by path_topk, '
-                         'node_marginal, soft_topk, and greedy_topk.')
+                         'node_marginal, soft_topk, greedy_topk, sample_rsd, '
+                         'and sample_rsd_offline (use 4 for Sampled tree EAL).')
+parser.add_argument('--srsd_cache', type=str, default='',
+                    help='Directory of precomputed target-verified path bank '
+                         'for sample_rsd_offline (from build_srsd_cache.py). '
+                         'Train matches draft paths against this bank.')
+parser.add_argument('--srsd_tgt_cache', action='store_true', default=True,
+                    help='sample_rsd: LRU-cache target top-m logits along draft '
+                         'paths; skip target tree decode on a full path hit.')
+parser.add_argument('--no_srsd_tgt_cache', action='store_false', dest='srsd_tgt_cache',
+                    help='Disable the online target path cache for sample_rsd.')
+parser.add_argument('--srsd_tgt_cache_m', type=int, default=256,
+                    help='Top-m target logits stored per path node in the online cache.')
+parser.add_argument('--srsd_tgt_cache_max_paths', type=int, default=4096,
+                    help='LRU capacity (number of paths) for the online target cache.')
 parser.add_argument('--path_eal_weights', type=str, default='',
                     help='Comma-separated greedy_topk weights, best path first. '
                          'Example: 1,2,3,4 gives the highest draft-probability '
@@ -200,6 +241,29 @@ parser.add_argument('--prob_starts', action='store_true',
                          'probability a window starts there (renewal recursion over '
                          'the greedy tree acceptance surrogate) instead of the exact '
                          'starts.')
+parser.add_argument('--seed', type=int, default=0,
+                    help='Data-order seed; > 0 also seeds torch/numpy/random.')
+parser.add_argument('--dpace_alpha', type=float, default=-1.0,
+                    help='dense_tree: replace the dense KL by the D-PACE weighted CE '
+                         '(blocks of gamma positions at every supervised position) with '
+                         'this smoothing alpha; < 0 disables.')
+parser.add_argument('--gto_coef', type=float, default=0.0,
+                    help='dense_tree: add gto_coef * the GTO group-tree PPO loss against '
+                         'a frozen copy of the initial draft.')
+parser.add_argument('--eal_path_agg', choices=['mean', 'max'], default='mean',
+                    help='--top4_start_eal: score each window by the mean of its kept '
+                         'paths\' E[L] or by the longest one.')
+parser.add_argument('--eal_alpha', type=float, default=0.0,
+                    help='--top4_start_eal: smooth each path factor q_j to '
+                         '(1 - alpha) q_j + alpha, as in D-PACE.')
+parser.add_argument('--boundary_tau', type=float, default=0.0,
+                    help='--top4_start_eal: replace the path E[L] by softplus(-margin/tau) '
+                         'on the positions each window reaches, margin = z(u) minus the '
+                         'k_j-th largest other draft logit.')
+parser.add_argument('--eal_all_starts', action='store_true',
+                    help='--top4_start_eal: train the E[L] of a window at every '
+                         'supervised position with equal weight and no truncation at '
+                         'the first mismatch (uniform baseline for the weighted runs).')
 parser.add_argument('--dense_kl', action='store_true',
                     help='top4_kl_eal: add the teacher-forced KL(p||q) over every '
                          'supervised position of the sequence (the chain KL).')
@@ -214,6 +278,9 @@ parser.add_argument('--save_every_steps', type=int, default=1000,
                          'into savedir/mid. Only the newest one is kept, without the '
                          'frozen target weights. Rounded up to a multiple of '
                          'gradient_accumulation_steps. 0 saves only at epoch end.')
+parser.add_argument('--snapshot_frac', type=float, default=0.0,
+                    help='Also save the draft as savedir/hf_e{epoch}_p{percent} every '
+                         'this fraction of an epoch (kept, for training-curve evals).')
 parser.add_argument('--local_rank', type=int, default=-1)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -244,12 +311,111 @@ def find_latest_checkpoint(directory):
     return f"{directory}/state_{max_epoch}", max_epoch + 1
 
 
+class SRSDCacheDataset(torch.utils.data.Dataset):
+    """Offline Sampled-tree EAL cache (lazy per-shard load).
+
+    The on-disk bank is ~180GB of full-vocab target logits. Loading every
+    shard into RAM OOMs a 200GB node; we only keep an LRU of a few shards
+    resident and index (shard_id, local_id) up front.
+    """
+
+    def __init__(self, cache_dir, keep_shards=2):
+        import glob
+        from collections import OrderedDict
+        self.shard_paths = sorted(glob.glob(os.path.join(cache_dir, "shard_*.pt")))
+        if not self.shard_paths:
+            raise RuntimeError(f"no shard_*.pt under {cache_dir}")
+        self.keep_shards = max(int(keep_shards), 1)
+        self._lru = OrderedDict()  # path -> list[record]
+        self.index = []  # (shard_i, local_i)
+        # Peek shard lengths one at a time (peak ≈ one shard, ~2GB).
+        for si, path in enumerate(self.shard_paths):
+            recs = torch.load(path, map_location="cpu")
+            if si == 0:
+                if "path_tokens" not in recs[0] or "path_nodes" not in recs[0]:
+                    raise RuntimeError(
+                        f"{cache_dir} is an old teacher-force cache; rebuild "
+                        "with build_srsd_cache.py (needs path_tokens/path_nodes)")
+            for li in range(len(recs)):
+                self.index.append((si, li))
+            del recs
+        print(f"[SmallLMTreeV2] offline cache index {len(self.index)} recs "
+              f"in {len(self.shard_paths)} shards "
+              f"(lazy, keep_shards={self.keep_shards})")
+
+    def __len__(self):
+        return len(self.index)
+
+    def _shard(self, si):
+        path = self.shard_paths[si]
+        if path in self._lru:
+            self._lru.move_to_end(path)
+            return self._lru[path]
+        recs = torch.load(path, map_location="cpu")
+        self._lru[path] = recs
+        while len(self._lru) > self.keep_shards:
+            self._lru.popitem(last=False)
+        return recs
+
+    def __getitem__(self, idx):
+        si, li = self.index[idx]
+        return self._shard(si)[li]
+
+
+class SRSDCacheCollator:
+    def __call__(self, features):
+        max_len = max(int(f["input_ids"].numel()) for f in features)
+        max_m = max(int(f["tokens"].numel()) for f in features)
+        max_p = max(int(f["path_tokens"].size(0)) for f in features)
+        gamma = int(features[0]["path_tokens"].size(1))
+        B = len(features)
+        V = int(features[0]["tgt_node"].size(-1))
+        batch = {
+            "input_ids": torch.zeros(B, max_len, dtype=torch.long),
+            "attention_mask": torch.zeros(B, max_len, dtype=torch.long),
+            "loss_mask": torch.zeros(B, max_len, dtype=torch.long),
+            "srsd_tokens": torch.zeros(B, max_m, dtype=torch.long),
+            "srsd_parents": torch.full((B, max_m), -1, dtype=torch.long),
+            "srsd_depths": torch.zeros(B, max_m, dtype=torch.long),
+            "srsd_tgt_node": torch.zeros(B, max_m, V, dtype=torch.bfloat16),
+            "srsd_valid": torch.zeros(B, max_m, dtype=torch.bool),
+            "srsd_path_tokens": torch.full((B, max_p, gamma), -1, dtype=torch.long),
+            "srsd_path_nodes": torch.full((B, max_p, gamma), -1, dtype=torch.long),
+            "srsd_anchor_pos": torch.zeros(B, dtype=torch.long),
+        }
+        for i, f in enumerate(features):
+            L = int(f["input_ids"].numel())
+            M = int(f["tokens"].numel())
+            P = int(f["path_tokens"].size(0))
+            batch["input_ids"][i, :L] = f["input_ids"].long()
+            batch["attention_mask"][i, :L] = f["attention_mask"].long()
+            batch["loss_mask"][i, :L] = f["loss_mask"].long()
+            batch["srsd_tokens"][i, :M] = f["tokens"].long()
+            batch["srsd_parents"][i, :M] = f["parents"].long()
+            batch["srsd_depths"][i, :M] = f["depths"].long()
+            batch["srsd_tgt_node"][i, :M] = f["tgt_node"]
+            batch["srsd_valid"][i, :M] = True
+            batch["srsd_path_tokens"][i, :P] = f["path_tokens"].long()
+            batch["srsd_path_nodes"][i, :P] = f["path_nodes"].long()
+            batch["srsd_anchor_pos"][i] = int(f["anchor_pos"])
+        return batch
+
+
 tokenizer = AutoTokenizer.from_pretrained(args.basepath, trust_remote_code=True)
-traindataset = build_dataset(tokenizer, args.trainpath, args.max_len,
-                             max_samples=args.max_train_samples,
-                             gamma=args.gamma)
-testdataset = build_dataset(tokenizer, args.testpath, args.max_len,
-                            gamma=args.gamma)
+if args.eal_mode == "sample_rsd_offline":
+    if not args.srsd_cache:
+        raise SystemExit("sample_rsd_offline requires --srsd_cache DIR")
+    traindataset = SRSDCacheDataset(args.srsd_cache)
+    testdataset = build_dataset(tokenizer, args.testpath, args.max_len,
+                                gamma=args.gamma)
+    print(f"[SmallLMTreeV2] offline cache {args.srsd_cache}: "
+          f"{len(traindataset)} records")
+else:
+    traindataset = build_dataset(tokenizer, args.trainpath, args.max_len,
+                                 max_samples=args.max_train_samples,
+                                 gamma=args.gamma)
+    testdataset = build_dataset(tokenizer, args.testpath, args.max_len,
+                                gamma=args.gamma)
 
 n_gpus = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
 micro_bs = ds_config["train_micro_batch_size_per_gpu"]
@@ -269,6 +435,13 @@ total_iters = iters_per_epoch * args.num_epochs
 save_every = args.save_every_steps
 if save_every > 0:
     save_every = math.ceil(save_every / grad_accum) * grad_accum
+snapshots = {}
+if args.snapshot_frac > 0:
+    for k in range(1, int(math.ceil(1.0 / args.snapshot_frac))):
+        frac = k * args.snapshot_frac
+        b = int(round(frac * iters_per_epoch / grad_accum)) * grad_accum
+        if 0 < b < iters_per_epoch:
+            snapshots[b] = int(round(100 * frac))
 
 # Print tree shape
 depth_counts = [top_k_list[0]]
@@ -295,6 +468,13 @@ if zero_stage == 3:
     from transformers.integrations import HfDeepSpeedConfig
     _hf_ds_config = HfDeepSpeedConfig(ds_config)
 
+if args.seed > 0:
+    import random
+    import numpy as np
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
 model = SmallLMTreeV2Model(
     target_path=args.basepath,
     draft_path=args.draftpath,
@@ -313,13 +493,36 @@ model.exact_starts_chunk = args.exact_starts_chunk
 model.exact_attn_backend = args.exact_attn_backend
 model.exact_batching = args.exact_batching
 model.exact_vocab_topk = args.exact_vocab_topk
+model.srsd_tgt_cache = bool(args.srsd_tgt_cache) and args.eal_mode == "sample_rsd"
+model.srsd_grad_mode = str(args.srsd_grad_mode)
+if args.eal_mode == "sample_rsd":
+    print(f"[SmallLMTreeV2] srsd_grad_mode={model.srsd_grad_mode}")
+if model.srsd_tgt_cache:
+    try:
+        from sdpo.srsd_tgt_cache import OnlineTargetPathCache
+    except ImportError:
+        from srsd_tgt_cache import OnlineTargetPathCache
+    model._srsd_tgt_bank = OnlineTargetPathCache(
+        max_paths=args.srsd_tgt_cache_max_paths, top_m=args.srsd_tgt_cache_m)
+    print(f"[SmallLMTreeV2] online target path cache "
+          f"m={args.srsd_tgt_cache_m} max_paths={args.srsd_tgt_cache_max_paths}")
+else:
+    model._srsd_tgt_bank = None
 model.top4_start_eal = args.top4_start_eal
 model.prob_starts = args.prob_starts
+model.eal_all_starts = args.eal_all_starts
+model.boundary_tau = args.boundary_tau
+model.eal_path_agg = args.eal_path_agg
+model.eal_alpha = args.eal_alpha
 model.exact_segment_frac = args.exact_segment_frac
 model.exact_burn = args.exact_burn
 model.exact_random_frac = args.exact_random_frac
 model.eal_gn_ratio = args.eal_gradnorm_ratio
 model.eal_gn_every = args.eal_gradnorm_every
+model.dpace_alpha = args.dpace_alpha
+model.gto_coef = args.gto_coef
+if args.gto_coef > 0:
+    model.init_gto_ref(args.draftpath, model_dtype)
 
 args.deepspeed_config = None
 trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -372,13 +575,15 @@ class _SkipSampler(torch.utils.data.Sampler):
 os.makedirs(args.savedir, exist_ok=True)
 train_sampler = _SkipSampler(
     DistributedSampler(traindataset, num_replicas=world_size,
-                       rank=global_rank, shuffle=True),
+                       rank=global_rank, shuffle=True, seed=args.seed),
     micro_bs)
 test_sampler = DistributedSampler(testdataset, num_replicas=world_size,
                                   rank=global_rank, shuffle=False)
+train_collate = (SRSDCacheCollator() if args.eal_mode == "sample_rsd_offline"
+                 else DataCollator())
 train_loader = DataLoader(traindataset, batch_size=micro_bs,
                           sampler=train_sampler, num_workers=0,
-                          pin_memory=True, collate_fn=DataCollator())
+                          pin_memory=True, collate_fn=train_collate)
 test_loader = DataLoader(testdataset, batch_size=micro_bs,
                          sampler=test_sampler, num_workers=0,
                          pin_memory=True, collate_fn=DataCollator())
@@ -507,8 +712,12 @@ for epoch in range(start_epoch, args.num_epochs):
         if (save_every > 0 and batch_idx > resume_skip
                 and batch_idx % save_every == 0):
             _save_mid(epoch, batch_idx)
+        if batch_idx in snapshots and batch_idx > resume_skip and global_rank == 0:
+            snap_dir = f"{args.savedir}/hf_e{epoch}_p{snapshots[batch_idx]:03d}"
+            if not os.path.exists(os.path.join(snap_dir, "config.json")):
+                model_engine.module.draft_model.save_pretrained(snap_dir)
         model.zero_grad()
-        total_loss, _, metrics = model_engine(
+        fwd_kwargs = dict(
             input_ids=data["input_ids"].to(rank),
             attention_mask=data["attention_mask"].to(rank),
             loss_mask=data["loss_mask"].to(rank),
@@ -524,6 +733,18 @@ for epoch in range(start_epoch, args.num_epochs):
             n_anchors=args.n_anchors,
             n_draws=args.n_draws,
         )
+        if args.eal_mode == "sample_rsd_offline":
+            fwd_kwargs.update(
+                srsd_tokens=data["srsd_tokens"].to(rank),
+                srsd_parents=data["srsd_parents"].to(rank),
+                srsd_depths=data["srsd_depths"].to(rank),
+                srsd_tgt_node=data["srsd_tgt_node"].to(rank),
+                srsd_valid=data["srsd_valid"].to(rank),
+                srsd_path_tokens=data["srsd_path_tokens"].to(rank),
+                srsd_path_nodes=data["srsd_path_nodes"].to(rank),
+                srsd_anchor_pos=data["srsd_anchor_pos"].to(rank),
+            )
+        total_loss, _, metrics = model_engine(**fwd_kwargs)
         # Always backward+step (rank-safe). See memory.md 2026-04-21.
         model_engine.backward(total_loss)
         grad_norm = model_engine.get_global_grad_norm()
@@ -562,20 +783,28 @@ for epoch in range(start_epoch, args.num_epochs):
                         "eal_gn_coef", "gnorm_kl", "gnorm_eal", "windows_per_seq",
                         "exact_al_at_starts", "exact_al_all_pos",
                         "prob_windows_per_seq", "exact_expanded_frac",
-                        "exact_rounds"):
+                        "exact_rounds", "match_rate", "n_matched_paths",
+                        "num_valid", "tgt_cache_hit_rate", "tgt_cache_size",
+                        "tgt_cache_skipped"):
                 if key in metrics:
                     row[key] = metrics[key]
             for key in metrics:
                 if key.startswith("path") and key.endswith(("_eal", "_al", "_var")):
                     row[key] = metrics[key]
             _append_jsonl(step_log_path, row)
+            extra = ""
+            if "tgt_cache_hit_rate" in row:
+                extra += (f"  tgt_hit={row['tgt_cache_hit_rate']:.2f}"
+                          f"  cache_n={int(row.get('tgt_cache_size', 0))}")
+            if "match_rate" in row:
+                extra += f"  match={row['match_rate']:.2f}"
             print(f"  step {global_step} epoch {epoch} | "
                   f"loss={row['loss']:.4f}  eal_loss={row['eal_loss']:.4f}  "
                   f"dense_loss={metrics['dense_loss']:.4f}  "
                   f"analytic_accepted_length={row['analytic_accepted_length']:.4f}  "
-                  f"kl={row['kl']:.4f}  grad_norm={row['grad_norm']:.4f}",
+                  f"kl={row['kl']:.4f}  grad_norm={row['grad_norm']:.4f}{extra}",
                   flush=True)
-            wandb.log({
+            wb = {
                 "train/total_loss": metrics["total_loss"],
                 "train/kl_loss": metrics["kl_loss"],
                 "train/aux_loss": metrics["aux_loss"],
@@ -585,7 +814,12 @@ for epoch in range(start_epoch, args.num_epochs):
                 "train/num_anchors": metrics["num_anchors"],
                 "train/grad_norm": gn,
                 "train/lr": lr,
-            }, step=global_step)
+            }
+            for k in ("tgt_cache_hit_rate", "tgt_cache_size", "tgt_cache_skipped",
+                      "match_rate", "n_matched_paths", "tree_nodes"):
+                if k in metrics:
+                    wb[f"train/{k}"] = metrics[k]
+            wandb.log(wb, step=global_step)
 
     if global_rank == 0 and n_batches > 0:
         print(f"  epoch {epoch} | total={sum_total/n_batches:.4f}  "

@@ -82,10 +82,11 @@ parser.add_argument('--eal_mode', type=str, default='budget',
                          'sample_rsd: online Sampled tree EAL. Draft samples '
                          'the full tree, keeps --path_topk draft-score paths, '
                          'target verifies ONLY that pruned union. '
-                         'P(A(v))=P(parent)*prod_{u before v}(1-a(u))*a(v), '
-                         'a=min(1,u/q); after reject u<-norm(max(u-q,0)) and '
-                         'q drops v. E[L]=sum_v P(A(v)). '
-                         'loss = anchor_kl_coef*KL + eal_aux_coef*(-E[L]). '
+                         'Train loss = dense residual TV '
+                         '(β=Σ_v min(u_v,q_v) under RSD residual; Chain '
+                         'al_tv analogue; no RL). Logged metric = analytic '
+                         'RSD E[L]. loss = anchor_kl_coef*KL + '
+                         'eal_aux_coef*(-dense_tv). '
                          'Eval with --draft-mode sample --verify-mode rsd. '
                          'sample_rsd_offline: draft resamples a tree and keeps '
                          '--path_topk paths; a path is used only if its token '
@@ -138,23 +139,15 @@ parser.add_argument('--soft_target_m', type=int, default=4,
                          'eal_mode=wsoft. Tokens already in the draft top-k '
                          'are not added twice.')
 parser.add_argument('--n_draws', type=int, default=2,
-                    help='Independent tree draws per anchor. sample_anyk / '
-                         'sample_rsd auto-bump to >=2 when eal_score_coef!=0 '
-                         'so the within-anchor score-function baseline is live.')
+                    help='Independent tree draws per anchor. sample_anyk '
+                         'auto-bumps to >=2 when eal_score_coef!=0 so the '
+                         'within-anchor score-function baseline is live. '
+                         'sample_rsd ignores this for the loss (dense_tv).')
 parser.add_argument('--eal_score_coef', type=float, default=0.1,
                     help='Weight of the score-function (sampling) term in '
-                         'sample_anyk and sample_rsd. Needs --n_draws>=2 for a '
-                         'non-zero within-anchor baseline (enforced in forward). '
-                         '0 keeps only the value term. For srsd_grad_mode=reinforce '
-                         'this scales adv*logπ (defaulted to 1 if 0).')
-parser.add_argument('--srsd_grad_mode', type=str, default='pq_ratio',
-                    choices=['pq_ratio', 'minpq', 'reinforce', 'minpq_reinforce'],
-                    help='sample_rsd gradient estimator: '
-                         'pq_ratio=live a=min(1,p/q)+mean logq score (legacy); '
-                         'minpq=value via α=min(p,q) path-sum (ALTV-shaped); '
-                         'reinforce=stopgrad RSD E[L] + WoR logπ(τ) '
-                         '(adv clamp±5, |logπ| scale; auto n_draws>=4); '
-                         'minpq_reinforce=dense minpq value + reinforce score.')
+                         'sample_anyk only. Needs --n_draws>=2 for a non-zero '
+                         'within-anchor baseline (enforced in forward). '
+                         '0 keeps only the value term. Unused by sample_rsd.')
 parser.add_argument('--n_anchors', type=int, default=1,
                     help='Trees per sequence per step. >1 raises the supervision '
                          'per sample and gives sample_anyk its baseline.')
@@ -423,8 +416,8 @@ grad_accum = ds_config["gradient_accumulation_steps"]
 effective_bs = micro_bs * grad_accum * n_gpus
 steps_per_epoch = math.ceil(len(traindataset) / effective_bs)
 total_steps = steps_per_epoch * args.num_epochs
-warmup_steps = total_steps // 10
-ds_config["scheduler"]["params"]["total_num_steps"] = total_steps
+warmup_steps = max(1, total_steps // 10)
+ds_config["scheduler"]["params"]["total_num_steps"] = max(1, total_steps)
 ds_config["scheduler"]["params"]["warmup_num_steps"] = warmup_steps
 if args.lr is not None:
     ds_config["scheduler"]["params"]["warmup_max_lr"] = args.lr
@@ -494,9 +487,8 @@ model.exact_attn_backend = args.exact_attn_backend
 model.exact_batching = args.exact_batching
 model.exact_vocab_topk = args.exact_vocab_topk
 model.srsd_tgt_cache = bool(args.srsd_tgt_cache) and args.eal_mode == "sample_rsd"
-model.srsd_grad_mode = str(args.srsd_grad_mode)
 if args.eal_mode == "sample_rsd":
-    print(f"[SmallLMTreeV2] srsd_grad_mode={model.srsd_grad_mode}")
+    print("[SmallLMTreeV2] sample_rsd loss = dense residual TV (Chain al_tv analogue)")
 if model.srsd_tgt_cache:
     try:
         from sdpo.srsd_tgt_cache import OnlineTargetPathCache
@@ -891,16 +883,27 @@ for epoch in range(start_epoch, args.num_epochs):
     deepspeed.comm.barrier()
     torch.cuda.empty_cache()
 
-    # The frozen 8B target is ~30GB per save; only the draft and optimizer
-    # are needed to resume, and only the newest epoch state is kept.
+    # Save HF draft FIRST: on 1x40GB, ZeRO save_checkpoint can OOM/NCCL-fail
+    # after epoch eval and would otherwise skip the usable eval weights.
     ckpt_dir = f"{args.savedir}/state_{epoch}"
-    model_engine.save_checkpoint(ckpt_dir, exclude_frozen_parameters=True)
+    hf_dir = f"{args.savedir}/hf_epoch_{epoch}"
     if global_rank == 0:
-        hf_dir = f"{args.savedir}/hf_epoch_{epoch}"
-        model_engine.module.draft_model.save_pretrained(hf_dir)
-        tokenizer.save_pretrained(hf_dir)
-        print(f"  Saved DeepSpeed checkpoint to {ckpt_dir}")
-        print(f"  Saved HF draft to {hf_dir}")
+        try:
+            model_engine.module.draft_model.save_pretrained(hf_dir)
+            tokenizer.save_pretrained(hf_dir)
+            print(f"  Saved HF draft to {hf_dir}", flush=True)
+        except Exception as e:
+            print(f"  WARNING: HF draft save failed: {e}", flush=True)
+    deepspeed.comm.barrier()
+    try:
+        model_engine.save_checkpoint(ckpt_dir, exclude_frozen_parameters=True)
+        if global_rank == 0:
+            print(f"  Saved DeepSpeed checkpoint to {ckpt_dir}", flush=True)
+    except Exception as e:
+        if global_rank == 0:
+            print(f"  WARNING: DeepSpeed checkpoint save failed (HF draft kept): {e}",
+                  flush=True)
+    if global_rank == 0:
         shutil.rmtree(mid_dir, ignore_errors=True)
         for old in range(epoch):
             shutil.rmtree(f"{args.savedir}/state_{old}", ignore_errors=True)

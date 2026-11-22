@@ -27,8 +27,8 @@ Repo-local mirrors of the same files (when present under this checkout):
 
 JSONL schema for train/val: one object per line with `id` and `conversations` (ShareGPT-style turns). Assistant content must be **target-regenerated** so train-time acceptance matches decode-time target.
 
-**Active sample tree EAL long run** (`gtree_srsd_minpq`):  
-`--eal_mode sample_rsd --srsd_grad_mode minpq --path_topk 4 --n_anchors 4 --anchor_kl_coef 0.1`, train/val paths as in the table, 3 epochs × up to 100k train samples; epoch eval = `--draft-mode sample --verify-mode rsd --path-topk 4` on MT-Bench.
+**Sample tree EAL** (`sample_rsd`):  
+`--eal_mode sample_rsd --path_topk 4 --n_anchors 4 --anchor_kl_coef 0.1` (train loss = dense residual TV `Σ min(u,q)` under RSD; no RL / no `srsd_grad_mode`). Eval = `--draft-mode sample --verify-mode rsd --path-topk 4`.
 
 ## Loss menu (`--anchor` × `--aux_loss`)
 

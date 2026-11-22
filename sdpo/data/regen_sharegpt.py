@@ -171,20 +171,36 @@ class ShareGPTProcessor:
     def process_dataset(self, data_path: str, output_path: str, batch_size: int,
                         max_samples: int, checkpoint_every: int):
         print(f"Loading ShareGPT dataset from {data_path} ...")
+        items = []
         if os.path.isdir(data_path) or data_path.startswith("hf://"):
             ds = load_dataset(data_path)["train"]
+            ds = ds.shuffle(seed=42)
+            if max_samples and max_samples > 0:
+                ds = ds.select(range(min(max_samples, len(ds))))
+            for i, item in enumerate(ds):
+                item = dict(item)
+                if "id" not in item:
+                    item["id"] = f"sharegpt_{i:06d}"
+                items.append(item)
         else:
-            ds = load_dataset("json", data_files=data_path)["train"]
-        ds = ds.shuffle(seed=42)
-        if max_samples and max_samples > 0:
-            ds = ds.select(range(min(max_samples, len(ds))))
-        print(f"Dataset loaded: {len(ds)} conversations")
-
-        items = []
-        for i, item in enumerate(ds):
-            if "id" not in item:
-                item["id"] = f"sharegpt_{i:06d}"
-            items.append(item)
+            # Plain JSONL: avoid datasets/pyarrow schema merge failures on messy ShareGPT
+            raw = []
+            with open(data_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    raw.append(json.loads(line))
+            import random
+            rng = random.Random(42)
+            rng.shuffle(raw)
+            if max_samples and max_samples > 0:
+                raw = raw[:max_samples]
+            for i, item in enumerate(raw):
+                if "id" not in item:
+                    item["id"] = f"sharegpt_{i:06d}"
+                items.append(item)
+        print(f"Dataset loaded: {len(items)} conversations")
 
         regenerated, written = [], 0
         with tqdm(total=len(items), desc="regen") as pbar:

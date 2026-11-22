@@ -412,8 +412,8 @@ grad_accum = ds_config["gradient_accumulation_steps"]
 effective_bs = micro_bs * grad_accum * n_gpus
 steps_per_epoch = math.ceil(len(traindataset) / effective_bs)
 total_steps = steps_per_epoch * args.num_epochs
-warmup_steps = total_steps // 10
-ds_config["scheduler"]["params"]["total_num_steps"] = total_steps
+warmup_steps = max(1, total_steps // 10)
+ds_config["scheduler"]["params"]["total_num_steps"] = max(1, total_steps)
 ds_config["scheduler"]["params"]["warmup_num_steps"] = warmup_steps
 if args.lr is not None:
     ds_config["scheduler"]["params"]["warmup_max_lr"] = args.lr

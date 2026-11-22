@@ -27,13 +27,11 @@ Per training step, per sample:
        Eval must use --draft-mode sample --verify-mode ratio.
      sample_rsd (online Sampled tree EAL): draft samples the full tree, keeps
        the --path_topk draft-score paths, and target verifies ONLY that
-       pruned union. Residual EAL:
-       P(A(v)) = P(parent) * prod_{u before v}(1-a(u)) * a(v) with
-       a = min(1, u/q); after reject u <- norm(max(u-q,0)), q drops v.
-       E[L] = sum_v P(A(v)). loss ≈ -E[L] (+ score-fn; optional KL).
-       Eval: --draft-mode sample --verify-mode rsd --path-topk K (RSD walks
-       only the same path-topk union; off-union siblings do not consume
-       residual mass).
+       pruned union. Train loss = Chain-style dense residual TV EAL:
+         β = Σ_v min(u_v, q_v) under the RSD residual (identity
+         E[min(1,p/q)]=Σmin(p,q); NO ratio-at-token / RL score term).
+       Logged metric = analytic RSD E[L] with a=min(1,u/q).
+       Eval: --draft-mode sample --verify-mode rsd --path-topk K.
      sample_rsd_offline: draft still samples a fresh tree and keeps --path_topk
        paths; target logits come from --srsd_cache (a bank of target-verified
        paths). A draft path is kept only if its token sequence matches a
@@ -302,44 +300,6 @@ def _center_by_group(x, group):
     return torch.where(cnt[g] > 1, out, torch.zeros_like(out))
 
 
-def _wor_logprob(logits, toks, temperature=1.0):
-    """Sequential without-replacement log-prob of `toks` under `logits`.
-
-    logits: [B, V] with toks [B, K], or [B, N, V] with toks [B, N, K].
-    Tokens are treated as stopgrad ids; gradients flow through logits only.
-    """
-    T = max(float(temperature), 1e-6)
-    if logits.dim() == 2:
-        B, K = toks.shape
-        log_p = F.log_softmax(logits / T, dim=-1)
-        neg_inf = torch.finfo(log_p.dtype).min
-        # Out-of-place mask updates: inplace scatter_ on `blocked` breaks
-        # autograd versioning through masked_fill.
-        blocked = torch.zeros_like(log_p, dtype=torch.bool)
-        total = logits.new_zeros(B)
-        for t in range(K):
-            lp = log_p.masked_fill(blocked, neg_inf)
-            lp = lp - torch.logsumexp(lp, dim=-1, keepdim=True)
-            total = total + lp.gather(-1, toks[:, t:t + 1]).squeeze(-1)
-            blocked = blocked.scatter(1, toks[:, t:t + 1], True)
-        return total
-    if logits.dim() != 3 or toks.dim() != 3:
-        raise ValueError(
-            f"_wor_logprob expected [B,V]+[B,K] or [B,N,V]+[B,N,K], "
-            f"got logits {tuple(logits.shape)} toks {tuple(toks.shape)}")
-    B, N, K = toks.shape
-    log_p = F.log_softmax(logits / T, dim=-1)
-    neg_inf = torch.finfo(log_p.dtype).min
-    blocked = torch.zeros_like(log_p, dtype=torch.bool)
-    total = logits.new_zeros(B, N)
-    for t in range(K):
-        lp = log_p.masked_fill(blocked, neg_inf)
-        lp = lp - torch.logsumexp(lp, dim=-1, keepdim=True)
-        total = total + lp.gather(-1, toks[:, :, t:t + 1]).squeeze(-1)
-        blocked = blocked.scatter(-1, toks[:, :, t:t + 1], True)
-    return total
-
-
 def sampled_tree_rsd_eal(tokens, tgt_node, drf_node, parents, temperature=1.0,
                          node_mask=None):
     """Sampled-tree E[L] with residual sibling verification (slides).
@@ -352,17 +312,10 @@ def sampled_tree_rsd_eal(tokens, tgt_node, drf_node, parents, temperature=1.0,
     after rejecting v: u <- norm(max(u - q, 0)), q[v] <- 0 and renorm q.
     E[L] = sum_v P(A(v)). Target u is detached.
 
-    Gradient: residual (u, q) trajectories are stopgrad — autodiff through the
-    dense V-dim p−q / renorm Jacobian blows up grad_norm (~100) and swamps the
-    accept signal. Forward a(v) still uses the exact residual masses; live
-    draft grad flows only through q_live[x] via
-      q_res[x] = q_live[x] / sum_{alive} q_live   (denom detached),
-    matching sample_anyk's gather-only pattern. Sampling the tree itself is
-    still stopgrad; pair with the score-function term (n_draws>=2).
-    parents may be [N] or [B, N] (topology shared across the batch).
-    node_mask [B, N] bool (optional): offline / path-limited training — only
-    masked-in nodes are verified; residual sibling updates run among the
-    kept siblings only (as if the other branches were never cached).
+    Used as a stopgrad / logged metric for sample_rsd (train loss is
+    sampled_tree_dense_tv_eal). Residual (u, q) trajectories are stopgrad;
+    live draft grad through q_live[x] is unused when this is only logged.
+    parents may be [N] or [B, N]. node_mask [B, N] optional path-limited verify.
     """
     B, N = tokens.shape
     T = max(float(temperature), 1e-6)
@@ -440,6 +393,99 @@ def sampled_tree_rsd_eal(tokens, tgt_node, drf_node, parents, temperature=1.0,
         accumulate=False,
     ).view(B, N)
     return P_accept.sum(dim=-1), P_accept
+
+
+def sampled_tree_dense_tv_eal(tokens, tgt_node, drf_node, parents, temperature=1.0,
+                              node_mask=None):
+    """Tree analogue of Chain al_tv: dense Σ_v min(u_v, q_v) under RSD residual.
+
+    Chain identity: E_{x~q}[min(1, p(x)/q(x))] = Σ_v min(p_v, q_v).
+    Differentiating Σ min(p,q) pushes q toward p (+1 where q<p). Differentiating
+    the conditional ratio min(1,p_x/q_x) at a fixed drafted x is anti-sampling.
+
+    Here each sibling group walks the same residual trajectory as RSD (u, alive
+    stopgrad), but the live accept factor at sibling t is the dense TV mass
+      β_t = Σ_v min(u_v, q_live_v) · 1[alive]
+    instead of a_t = min(1, u[x]/q[x]). Path masses use the same product rule
+    as sampled_tree_rsd_eal (P(A)=P(par)·reach·β, reach←reach·(1-β)).
+
+    No score-function / RL term is required: the value gradient is already
+    ALTV-shaped, matching Chain.
+    """
+    B, N = tokens.shape
+    T = max(float(temperature), 1e-6)
+    V = drf_node.size(-1)
+    q_floor = 1e-9
+    p_full = torch.softmax(tgt_node / T, dim=-1).detach()
+    q_full = torch.softmax(drf_node / T, dim=-1)
+    flat_idx = []
+    flat_val = []
+    for b in range(B):
+        parents_b = parents[b] if parents.dim() == 2 else parents
+        children = [[] for _ in range(N)]
+        roots = []
+        for i in range(N):
+            if node_mask is not None and not bool(node_mask[b, i]):
+                continue
+            p = int(parents_b[i].item())
+            if p < 0:
+                roots.append(i)
+            else:
+                children[p].append(i)
+        P_node = [None] * N
+        groups = [roots] + [children[i] for i in range(N) if children[i]]
+        for sibs in groups:
+            if not sibs:
+                continue
+            sibs = sorted(sibs)
+            head = sibs[0]
+            par = int(parents_b[head].item())
+            q_live = q_full[b, head, :]
+            q_det = q_live.detach()
+            P_par = (P_node[par] if par >= 0 else q_live.new_ones(()))
+            with torch.no_grad():
+                u = p_full[b, head, :].clone()
+                alive = torch.ones(V, device=q_det.device, dtype=q_det.dtype)
+                u_list = []
+                alive_list = []
+                for t, node in enumerate(sibs):
+                    u_list.append(u.clone())
+                    alive_list.append(alive.clone())
+                    if t + 1 == len(sibs):
+                        break
+                    x = int(tokens[b, node].item())
+                    # Residual update mirrors RSD reject of drafted x (structure
+                    # only; stopgrad). Dense β below does not depend on x for
+                    # the live value — x only advances the residual for later
+                    # siblings, same as Chain advancing along the drafted chain.
+                    q_res = (q_det * alive)
+                    q_res = q_res / q_res.sum().clamp(min=q_floor)
+                    u = torch.clamp(u - q_res, min=0.0)
+                    u = u / u.sum().clamp(min=q_floor)
+                    alive = alive.scatter(
+                        0, torch.tensor([x], device=alive.device),
+                        torch.zeros(1, device=alive.device, dtype=alive.dtype))
+            reach = q_live.new_ones(())
+            for t, node in enumerate(sibs):
+                # Live dense TV: Σ min(u, q) on alive support (Chain β).
+                q_slot = q_live * alive_list[t]
+                q_slot = q_slot / q_slot.sum().clamp(min=q_floor)
+                beta = torch.minimum(u_list[t], q_slot).sum().clamp(0.0, 1.0)
+                pav = P_par * reach * beta
+                P_node[node] = pav
+                flat_idx.append(b * N + node)
+                flat_val.append(pav)
+                reach = reach * (1.0 - beta)
+    if not flat_val:
+        z = q_full.new_zeros(B)
+        return z
+    P_accept = q_full.new_zeros(B * N)
+    P_accept = P_accept.index_put(
+        (torch.tensor(flat_idx, device=q_full.device, dtype=torch.long),),
+        torch.stack(flat_val),
+        accumulate=False,
+    ).view(B, N)
+    return P_accept.sum(dim=-1)
 
 
 def tree_path_sum_eal(alpha, parents):
@@ -1398,19 +1444,11 @@ class SmallLMTreeV2Model(nn.Module):
         sample_tree = eal_mode in (
             "sample_minpq", "sample_anyk", "sample_cover",
             "sample_rsd", "sample_rsd_offline")
-        # Full-tree sampling log π(τ) for sample_rsd reinforce / hybrid (WoR).
-        _srsd_gm = str(getattr(self, "srsd_grad_mode", "pq_ratio"))
-        need_tree_log_pi = (
-            sample_tree and eal_mode == "sample_rsd"
-            and _srsd_gm in ("reinforce", "minpq_reinforce"))
-        tree_log_pi = None
         if sample_tree:
             with torch.no_grad():
                 root_tok = torch.multinomial(
                     torch.softmax(drf_root / T, dim=-1), top_k[0], replacement=False)
             root_scores = root_lp.gather(-1, root_tok)
-            if need_tree_log_pi:
-                tree_log_pi = _wor_logprob(drf_root, root_tok, temperature=T)
         else:
             root_scores, root_tok = root_lp.topk(top_k[0], dim=-1)
 
@@ -1455,9 +1493,6 @@ class SmallLMTreeV2Model(nn.Module):
                     child_tok = torch.multinomial(
                         flat_p, k, replacement=False).view(B, n_in, k)
                 child_sc = child_lp.gather(-1, child_tok)
-                if need_tree_log_pi:
-                    tree_log_pi = tree_log_pi + _wor_logprob(
-                        depth_pred, child_tok, temperature=T).sum(dim=1)
             else:
                 child_sc, child_tok = child_lp.topk(k, dim=-1)
             cum = scores_per_depth[-1].unsqueeze(-1) + child_sc
@@ -1827,67 +1862,16 @@ class SmallLMTreeV2Model(nn.Module):
                 eal = longest_path_from_accept(accept, parents)
             n_report = int(N)
         elif eal_mode == "sample_rsd":
-            # Residual analytic E[L|tree] on the path-topk union (matches eval
-            # RSD). Gradient mode (--srsd_grad_mode):
-            #   pq_ratio: live value through a=min(1,p/q) + mean-log-q score
-            #             (legacy; value is anti-sampling).
-            #   minpq:    value through α=min(p,q) path-sum (ALTV-shaped ∇q);
-            #             still log RSD E[L].
-            #   reinforce: RSD E[L] as stopgrad reward; WoR log π(τ) score only.
-            #   minpq_reinforce: dense minpq value + reinforce score (hybrid).
-            grad_mode = str(getattr(self, "srsd_grad_mode", "pq_ratio"))
-            eal_cond, _P_node = sampled_tree_rsd_eal(
+            # Train: dense residual TV (Chain al_tv analogue under RSD).
+            # Log: analytic RSD E[L|tree] on the path-topk union (eval metric).
+            eal_loss = -sampled_tree_dense_tv_eal(
                 tokens, tgt_node, drf_node, parents, temperature=T,
-                node_mask=node_mask)
-            tok_idx = tokens.long().unsqueeze(-1)
-
-            def _minpq_value():
-                p_n = torch.softmax(tgt_node / T, dim=-1).gather(
-                    -1, tok_idx).squeeze(-1).detach()
-                q_n = torch.softmax(drf_node / T, dim=-1).gather(
-                    -1, tok_idx).squeeze(-1)
-                a = torch.minimum(p_n, q_n)
-                if node_mask is not None:
-                    a = a * node_mask.float()
-                return tree_path_sum_eal(a, parents)
-
-            def _reinforce_score():
-                # Unbiased score for J = E_τ[RSD E[L|τ]]: stopgrad reward,
-                # WoR log π(τ). Advantage is within-anchor standardized +
-                # clamped; log π is magnitude-normalized so deep trees do not
-                # explode grad_norm (F2 ablate saw gn~500).
-                if tree_log_pi is None:
-                    raise RuntimeError(
-                        f"srsd_grad_mode={grad_mode} needs WoR tree_log_pi")
-                adv = _center_by_group(eal_cond.detach(), anchor_group)
-                adv = adv.clamp(-5.0, 5.0)
-                lp_scale = tree_log_pi.detach().abs().mean().clamp(min=1.0)
-                score_coef = float(eal_score_coef)
-                if score_coef == 0.0:
-                    score_coef = 1.0
-                return score_coef * (adv * (tree_log_pi / lp_scale)).mean()
-
-            if grad_mode == "minpq":
-                eal_loss = -_minpq_value().mean()
-            elif grad_mode == "reinforce":
-                eal_loss = -_reinforce_score()
-            elif grad_mode == "minpq_reinforce":
-                # Dense ALTV-shaped ∇q on tokens + discrete ∇ over tree τ.
-                eal_loss = -(_minpq_value().mean() + _reinforce_score())
-            else:
-                # pq_ratio (legacy)
-                log_q = torch.log_softmax(drf_node / T, dim=-1).gather(
-                    -1, tok_idx).squeeze(-1)
-                if node_mask is not None:
-                    w = node_mask.float()
-                    score = (log_q * w).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
-                else:
-                    score = log_q.mean(dim=1)
-                adv = _center_by_group(eal_cond.detach(), anchor_group)
-                eal_loss = -(eal_cond.mean()
-                             + float(eal_score_coef) * (adv * score).mean())
-            # Always log analytic RSD E[L|tree] (eval-aligned metric).
-            eal = eal_cond.detach().mean()
+                node_mask=node_mask).mean()
+            with torch.no_grad():
+                eal_cond, _P_node = sampled_tree_rsd_eal(
+                    tokens, tgt_node, drf_node, parents, temperature=T,
+                    node_mask=node_mask)
+            eal = eal_cond.mean()
             n_report = float(node_mask.float().sum(dim=-1).mean().item())
         elif eal_mode == "sample_cover":
             # One target draw per slot, siblings mutually exclusive. The cover
@@ -2813,20 +2797,9 @@ class SmallLMTreeV2Model(nn.Module):
         # draft entropy instead of steering the sampling.
         n_anchors = max(int(n_anchors), 1)
         n_draws = max(int(n_draws), 1)
-        # sample_rsd / sample_anyk score-function needs >=2 draws per anchor;
-        # with n_draws=1 the within-anchor advantage is identically zero.
-        # reinforce mode always needs a within-anchor baseline.
-        _srsd_gm = str(getattr(self, "srsd_grad_mode", "pq_ratio"))
-        need_score_baseline = (
-            (eal_mode in ("sample_rsd", "sample_anyk") and float(eal_score_coef) != 0.0)
-            or (eal_mode == "sample_rsd"
-                and _srsd_gm in ("reinforce", "minpq_reinforce")))
-        if need_score_baseline:
-            # reinforce / hybrid: prefer >=4 draws for a stabler baseline.
-            floor = (4 if (eal_mode == "sample_rsd"
-                           and _srsd_gm in ("reinforce", "minpq_reinforce"))
-                     else 2)
-            n_draws = max(n_draws, floor)
+        # sample_anyk score-function needs >=2 draws per anchor.
+        if eal_mode == "sample_anyk" and float(eal_score_coef) != 0.0:
+            n_draws = max(n_draws, 2)
         batch_idx = []
         anchor_pos = []
         anchor_group = []

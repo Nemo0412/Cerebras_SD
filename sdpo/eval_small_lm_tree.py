@@ -513,7 +513,7 @@ def main():
                 if sib.endswith('.bin'): continue
                 dst = os.path.join(fixed_dir, sib)
                 if not os.path.exists(dst):
-                    os.symlink(os.path.join(args.draft_model_path, sib), dst)
+                    os.symlink(os.path.abspath(os.path.join(args.draft_model_path, sib)), dst)
             draft_load_path = fixed_dir
         break   # one .bin per ckpt dir
 

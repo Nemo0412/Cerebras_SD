@@ -2980,14 +2980,94 @@ class SmallLMTreeV2Model(nn.Module):
         else:
             self._srsd_ctx_keys = None
 
-        out = self._rollout_batch(
-            batch_idx, anchor_pos, drf_anchor, tgt_anchor,
-            drf_keys, drf_values, tgt_keys, tgt_values, temperature,
-            eal_mode=eal_mode, path_topk=path_topk,
-            eal_score_coef=eal_score_coef, anchor_group=anchor_group,
-            anchor_kl_coef=anchor_kl_coef, path_eal_weights=path_eal_weights,
-            path_eal_mean=path_eal_mean, path_eal_var_coef=path_eal_var_coef,
-            tree_kl_w=tree_kl_w, tree_eal_w=tree_eal_w)
+        # sample_rsd: optional anchor micro-batching. Roll out at most
+        # --anchor_chunk trees at once; activation checkpointing keeps peak
+        # memory near one chunk while n_anchors can be larger (e.g. 16/32).
+        anchor_chunk = int(getattr(self, "anchor_chunk", 0) or 0)
+        use_anchor_chunks = (
+            eal_mode == "sample_rsd"
+            and anchor_chunk > 0
+            and len(batch_idx) > anchor_chunk
+        )
+        if use_anchor_chunks:
+            from torch.utils.checkpoint import checkpoint
+            # Detach prefix KV so checkpoint only tracks root-logit + tree-step
+            # graphs; otherwise closed-over KV-with-grad breaks non-reentrant
+            # checkpoint. Tree steps still train the draft; root rows still
+            # backprop through the prefix hidden state.
+            drf_keys_c = [k.detach() for k in drf_keys]
+            drf_values_c = [v.detach() for v in drf_values]
+            tgt_keys_c = [k.detach() for k in tgt_keys]
+            tgt_values_c = [v.detach() for v in tgt_values]
+            n_all = len(batch_idx)
+            chunk_outs = []
+            chunk_weights = []
+            all_ctx = self._srsd_ctx_keys
+            for start in range(0, n_all, anchor_chunk):
+                end = min(start + anchor_chunk, n_all)
+                bi = batch_idx[start:end]
+                ap = anchor_pos[start:end]
+                ag = (anchor_group[start:end]
+                      if anchor_group is not None else None)
+                da = drf_anchor[start:end]
+                ta = tgt_anchor[start:end]
+                tkw = (tree_kl_w[start:end]
+                       if tree_kl_w is not None else None)
+                tew = (tree_eal_w[start:end]
+                       if tree_eal_w is not None else None)
+                self._srsd_ctx_keys = (
+                    all_ctx[start:end] if all_ctx is not None else None)
+
+                def _chunk_forward(drf_a, tgt_a, _bi=bi, _ap=ap, _ag=ag,
+                                   _tkw=tkw, _tew=tew):
+                    o = self._rollout_batch(
+                        _bi, _ap, drf_a, tgt_a,
+                        drf_keys_c, drf_values_c, tgt_keys_c, tgt_values_c,
+                        temperature, eal_mode=eal_mode, path_topk=path_topk,
+                        eal_score_coef=eal_score_coef, anchor_group=_ag,
+                        anchor_kl_coef=anchor_kl_coef,
+                        path_eal_weights=path_eal_weights,
+                        path_eal_mean=path_eal_mean,
+                        path_eal_var_coef=path_eal_var_coef,
+                        tree_kl_w=_tkw, tree_eal_w=_tew)
+                    n_nodes_t = drf_a.new_zeros(()).float() + float(o["n_nodes"])
+                    extras = []
+                    for key in ("tgt_cache_hit_rate", "tgt_cache_size",
+                                "tgt_cache_skipped"):
+                        if key in o:
+                            extras.append(drf_a.new_tensor(float(o[key])))
+                        else:
+                            extras.append(drf_a.new_zeros(()))
+                    return torch.stack([
+                        o["eal_loss"], o["kl"], o["eal"], n_nodes_t, *extras])
+
+                packed = checkpoint(
+                    _chunk_forward, da, ta, use_reentrant=False)
+                chunk_outs.append(packed)
+                chunk_weights.append(float(end - start))
+            self._srsd_ctx_keys = all_ctx
+            w = drf_anchor.new_tensor(chunk_weights)
+            w = w / w.sum().clamp(min=1e-8)
+            packed_all = torch.stack(chunk_outs, dim=0)
+            mean_packed = (packed_all * w.view(-1, 1)).sum(dim=0)
+            out = {
+                "eal_loss": mean_packed[0],
+                "kl": mean_packed[1],
+                "eal": mean_packed[2],
+                "n_nodes": float(mean_packed[3].detach()),
+                "tgt_cache_hit_rate": float(mean_packed[4].detach()),
+                "tgt_cache_size": float(mean_packed[5].detach()),
+                "tgt_cache_skipped": float(mean_packed[6].detach()),
+            }
+        else:
+            out = self._rollout_batch(
+                batch_idx, anchor_pos, drf_anchor, tgt_anchor,
+                drf_keys, drf_values, tgt_keys, tgt_values, temperature,
+                eal_mode=eal_mode, path_topk=path_topk,
+                eal_score_coef=eal_score_coef, anchor_group=anchor_group,
+                anchor_kl_coef=anchor_kl_coef, path_eal_weights=path_eal_weights,
+                path_eal_mean=path_eal_mean, path_eal_var_coef=path_eal_var_coef,
+                tree_kl_w=tree_kl_w, tree_eal_w=tree_eal_w)
 
         if eal_mode in ("node_marginal", "sample_anyk", "sample_cover",
                         "wsoft", "greedy_topk"):

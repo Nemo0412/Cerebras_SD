@@ -151,6 +151,11 @@ parser.add_argument('--eal_score_coef', type=float, default=0.1,
 parser.add_argument('--n_anchors', type=int, default=1,
                     help='Trees per sequence per step. >1 raises the supervision '
                          'per sample and gives sample_anyk its baseline.')
+parser.add_argument('--anchor_chunk', type=int, default=0,
+                    help='sample_rsd only: roll out at most this many anchors at '
+                         'once (activation-checkpointed). 0 disables chunking. '
+                         'Use e.g. --n_anchors 16 --anchor_chunk 8 to raise '
+                         'coverage without the peak memory of 16 simultaneous trees.')
 parser.add_argument('--path_topk', type=int, default=16,
                     help='How many paths to keep. Used by path_topk, '
                          'node_marginal, soft_topk, greedy_topk, sample_rsd, '
@@ -487,8 +492,12 @@ model.exact_attn_backend = args.exact_attn_backend
 model.exact_batching = args.exact_batching
 model.exact_vocab_topk = args.exact_vocab_topk
 model.srsd_tgt_cache = bool(args.srsd_tgt_cache) and args.eal_mode == "sample_rsd"
+model.anchor_chunk = int(args.anchor_chunk)
 if args.eal_mode == "sample_rsd":
     print("[SmallLMTreeV2] sample_rsd loss = dense residual TV (Chain al_tv analogue)")
+    if model.anchor_chunk > 0:
+        print(f"[SmallLMTreeV2] anchor_chunk={model.anchor_chunk} "
+              f"(n_anchors={args.n_anchors})")
 if model.srsd_tgt_cache:
     try:
         from sdpo.srsd_tgt_cache import OnlineTargetPathCache
@@ -725,6 +734,7 @@ for epoch in range(start_epoch, args.num_epochs):
             n_anchors=args.n_anchors,
             n_draws=args.n_draws,
         )
+        # anchor_chunk is read from model.anchor_chunk inside forward
         if args.eal_mode == "sample_rsd_offline":
             fwd_kwargs.update(
                 srsd_tokens=data["srsd_tokens"].to(rank),

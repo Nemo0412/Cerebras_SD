@@ -15,6 +15,7 @@ Usage:
     --max_len 2048 --num_epochs 6
 """
 import argparse
+import collections
 import json
 import math
 import os
@@ -279,6 +280,15 @@ parser.add_argument('--save_every_steps', type=int, default=1000,
 parser.add_argument('--snapshot_frac', type=float, default=0.0,
                     help='Also save the draft as savedir/hf_e{epoch}_p{percent} every '
                          'this fraction of an epoch (kept, for training-curve evals).')
+parser.add_argument('--early_stop_al_window', type=int, default=0,
+                    help='If >0, track a rolling mean of analytic accept length over '
+                         'this many recent micro-batches (checked at mid-saves).')
+parser.add_argument('--early_stop_al_delta', type=float, default=0.02,
+                    help='Stop when rolling AL falls this far below the best seen '
+                         '(requires --early_stop_al_window and mid-saves).')
+parser.add_argument('--early_stop_al_patience', type=int, default=2,
+                    help='Number of consecutive mid-save checks with AL decline '
+                         'before stopping. 0 disables early stop.')
 parser.add_argument('--local_rank', type=int, default=-1)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -656,6 +666,34 @@ def _save_mid(epoch, batches_done):
     deepspeed.comm.barrier()
 
 
+def _save_hf_draft(hf_dir):
+    if global_rank != 0:
+        return
+    try:
+        os.makedirs(hf_dir, exist_ok=True)
+        model_engine.module.draft_model.save_pretrained(hf_dir)
+        tokenizer.save_pretrained(hf_dir)
+        print(f"  Saved HF draft to {hf_dir}", flush=True)
+    except Exception as e:
+        print(f"  WARNING: HF draft save failed ({hf_dir}): {e}", flush=True)
+
+
+def _rolling_al(hist):
+    if not hist:
+        return None
+    return sum(hist) / len(hist)
+
+
+# Early-stop on train analytic AL decline (checked at mid-saves).
+al_hist = collections.deque(
+    maxlen=max(int(args.early_stop_al_window), 1)
+) if args.early_stop_al_window > 0 else None
+best_roll_al = None
+al_decline_streak = 0
+early_stop = False
+hf_best_dir = os.path.join(args.savedir, "hf_best_al")
+
+
 def _append_jsonl(path, row):
     with open(path, "a") as f:
         f.write(json.dumps(row) + "\n")
@@ -713,6 +751,57 @@ for epoch in range(start_epoch, args.num_epochs):
         if (save_every > 0 and batch_idx > resume_skip
                 and batch_idx % save_every == 0):
             _save_mid(epoch, batch_idx)
+            # Keep a rolling HF draft at the latest mid-save for quick eval.
+            deepspeed.comm.barrier()
+            if global_rank == 0:
+                _save_hf_draft(os.path.join(args.savedir, "hf_mid"))
+            deepspeed.comm.barrier()
+            # AL early-stop check at mid-save points (needs a filled window).
+            stop_dev = (torch.device("cuda", rank)
+                        if torch.cuda.is_available() else torch.device("cpu"))
+            stop_flag = torch.zeros(1, dtype=torch.int32, device=stop_dev)
+            if (global_rank == 0 and al_hist is not None
+                    and args.early_stop_al_patience > 0
+                    and len(al_hist) >= min(args.early_stop_al_window, 50)):
+                roll = _rolling_al(al_hist)
+                improved = (best_roll_al is None
+                            or roll > best_roll_al + 1e-6)
+                if improved:
+                    best_roll_al = roll
+                    al_decline_streak = 0
+                    _save_hf_draft(hf_best_dir)
+                    meta = {
+                        "best_roll_al": best_roll_al,
+                        "step": global_step,
+                        "epoch": epoch,
+                        "window": len(al_hist),
+                    }
+                    with open(os.path.join(hf_best_dir, "best_al.json"), "w") as f:
+                        json.dump(meta, f, indent=2)
+                    print(f"  [early-stop] new best roll_AL={roll:.4f} "
+                          f"step={global_step} -> {hf_best_dir}", flush=True)
+                elif (best_roll_al is not None
+                      and roll < best_roll_al - args.early_stop_al_delta):
+                    al_decline_streak += 1
+                    print(f"  [early-stop] AL decline "
+                          f"roll={roll:.4f} best={best_roll_al:.4f} "
+                          f"streak={al_decline_streak}/"
+                          f"{args.early_stop_al_patience} step={global_step}",
+                          flush=True)
+                    if al_decline_streak >= args.early_stop_al_patience:
+                        stop_flag.fill_(1)
+                        print(f"  [early-stop] stopping: AL fell "
+                              f">={args.early_stop_al_delta} below best for "
+                              f"{al_decline_streak} mid-checks", flush=True)
+                else:
+                    al_decline_streak = 0
+                    print(f"  [early-stop] roll_AL={roll:.4f} "
+                          f"best={best_roll_al:.4f} (flat) step={global_step}",
+                          flush=True)
+            deepspeed.comm.broadcast(stop_flag, 0)
+            if int(stop_flag.item()) == 1:
+                early_stop = True
+                break
         if batch_idx in snapshots and batch_idx > resume_skip and global_rank == 0:
             snap_dir = f"{args.savedir}/hf_e{epoch}_p{snapshots[batch_idx]:03d}"
             if not os.path.exists(os.path.join(snap_dir, "config.json")):
@@ -765,6 +854,8 @@ for epoch in range(start_epoch, args.num_epochs):
         sum_anchors += metrics["num_anchors"]
 
         if global_rank == 0:
+            if al_hist is not None:
+                al_hist.append(float(metrics["eal_mean"]))
             lr = model_engine.get_lr()[0]
             row = {
                 "step": global_step,
@@ -822,6 +913,35 @@ for epoch in range(start_epoch, args.num_epochs):
                 if k in metrics:
                     wb[f"train/{k}"] = metrics[k]
             wandb.log(wb, step=global_step)
+
+    if early_stop:
+        deepspeed.comm.barrier()
+        if global_rank == 0:
+            print(f"[SmallLMTreeV2] Early stop at epoch={epoch} step={global_step}; "
+                  f"best roll_AL={best_roll_al} kept at {hf_best_dir}", flush=True)
+            # Point epoch-0 HF path at best so the existing eval sbatch works.
+            hf_link = f"{args.savedir}/hf_epoch_{epoch}"
+            if os.path.isdir(hf_best_dir):
+                if os.path.islink(hf_link) or os.path.exists(hf_link):
+                    if os.path.islink(hf_link):
+                        os.unlink(hf_link)
+                    else:
+                        shutil.rmtree(hf_link, ignore_errors=True)
+                try:
+                    os.symlink(hf_best_dir, hf_link)
+                except OSError:
+                    shutil.copytree(hf_best_dir, hf_link)
+            eval_job = _submit_epoch_eval(epoch)
+            if eval_job:
+                _append_jsonl(epoch_log_path, {
+                    "epoch": epoch,
+                    "early_stop": True,
+                    "best_roll_al": best_roll_al,
+                    "step": global_step,
+                    "accept_length_eval_job": eval_job,
+                    "hf_dir": hf_best_dir,
+                })
+        break
 
     if global_rank == 0 and n_batches > 0:
         print(f"  epoch {epoch} | total={sum_total/n_batches:.4f}  "
@@ -899,6 +1019,12 @@ for epoch in range(start_epoch, args.num_epochs):
     hf_dir = f"{args.savedir}/hf_epoch_{epoch}"
     if global_rank == 0:
         try:
+            # Early-stop may have left hf_epoch_* as a symlink to hf_best_al;
+            # replace it with a real directory so we do not overwrite best.
+            if os.path.islink(hf_dir):
+                os.unlink(hf_dir)
+            elif os.path.isdir(hf_dir):
+                shutil.rmtree(hf_dir, ignore_errors=True)
             model_engine.module.draft_model.save_pretrained(hf_dir)
             tokenizer.save_pretrained(hf_dir)
             print(f"  Saved HF draft to {hf_dir}", flush=True)

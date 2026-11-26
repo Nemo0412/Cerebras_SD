@@ -1,0 +1,1 @@
+{"epoch": 0, "train_loss": -2.82269663482599, "train_eal_loss": -2.911306396323102, "train_analytic_accepted_length": 3.3282931903445356, "train_kl": 0.8860976609400041, "train_grad_norm": 47.77017228111166, "test_loss": -2.302611827850342, "test_eal_loss": -2.4441450238227844, "test_analytic_accepted_length": 2.9732714891433716, "test_kl": 1.4153312146663666, "test_batches": 2}

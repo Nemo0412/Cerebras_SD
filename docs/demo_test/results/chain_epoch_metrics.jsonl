@@ -1,0 +1,2 @@
+{"epoch": 0, "train_loss": -2.5230293290806003, "train_analytic_accepted_length": 2.5268579755793326, "test_loss": -1.7738733887672424, "test_analytic_accepted_length": 2.375834494829178, "test_token_acc": 0.7298233487776348}
+{"epoch": 1, "train_loss": -2.6419966692919843, "train_analytic_accepted_length": 2.6270089723402634, "test_loss": -1.7762431800365448, "test_analytic_accepted_length": 2.4183963239192963, "test_token_acc": 0.7348091048853738}

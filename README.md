@@ -30,6 +30,8 @@ JSONL schema for train/val: one object per line with `id` and `conversations` (S
 **Sample tree EAL** (`sample_rsd`):  
 `--eal_mode sample_rsd --path_topk 4 --n_anchors 4 --anchor_kl_coef 0.1` (train loss = dense residual TV `Σ min(u,q)` under RSD; no RL / no `srsd_grad_mode`). Eval = `--draft-mode sample --verify-mode rsd --path-topk 4`.
 
+**Small-scale demo / go–no-go** (Chain EAL vs Sample Tree EAL on 2048 train + A/B/C/D OOD probes, tree ≤ ~1h): see [`docs/demo_test/README.md`](docs/demo_test/README.md).
+
 ## Loss menu (`--anchor` × `--aux_loss`)
 
 | Loss combo | `--anchor` | `--aux_loss` | `SIGMOID_COEF` | Other notes |

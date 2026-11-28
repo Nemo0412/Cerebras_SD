@@ -592,12 +592,21 @@ test_sampler = DistributedSampler(testdataset, num_replicas=world_size,
                                   rank=global_rank, shuffle=False)
 train_collate = (SRSDCacheCollator() if args.eal_mode == "sample_rsd_offline"
                  else DataCollator())
+# Prefetch on CPU workers so the GPU is not idle between tree rollouts
+# (matters on gh* nodes that enforce high GPU utilization).
+_num_workers = int(os.environ.get("SDPO_DATALOADER_WORKERS", "4"))
 train_loader = DataLoader(traindataset, batch_size=micro_bs,
-                          sampler=train_sampler, num_workers=0,
-                          pin_memory=True, collate_fn=train_collate)
+                          sampler=train_sampler, num_workers=_num_workers,
+                          pin_memory=True, persistent_workers=_num_workers > 0,
+                          prefetch_factor=4 if _num_workers > 0 else None,
+                          collate_fn=train_collate)
 test_loader = DataLoader(testdataset, batch_size=micro_bs,
-                         sampler=test_sampler, num_workers=0,
-                         pin_memory=True, collate_fn=DataCollator())
+                         sampler=test_sampler, num_workers=min(_num_workers, 2),
+                         pin_memory=True, persistent_workers=_num_workers > 0,
+                         prefetch_factor=2 if _num_workers > 0 else None,
+                         collate_fn=DataCollator())
+if global_rank == 0:
+    print(f"[SmallLMTreeV2] dataloader workers={_num_workers}", flush=True)
 
 mid_dir = os.path.join(args.savedir, "mid")
 mid_meta = os.path.join(mid_dir, "progress.json")
@@ -751,11 +760,13 @@ for epoch in range(start_epoch, args.num_epochs):
         if (save_every > 0 and batch_idx > resume_skip
                 and batch_idx % save_every == 0):
             _save_mid(epoch, batch_idx)
-            # Keep a rolling HF draft at the latest mid-save for quick eval.
-            deepspeed.comm.barrier()
-            if global_rank == 0:
-                _save_hf_draft(os.path.join(args.savedir, "hf_mid"))
-            deepspeed.comm.barrier()
+            # Optional HF mid dump (disabled on gh* via SAVE_HF_MID=0 to
+            # avoid long host syncs that drag hourly GPU utilization down).
+            if os.environ.get("SAVE_HF_MID", "1") not in ("0", "false", "False"):
+                deepspeed.comm.barrier()
+                if global_rank == 0:
+                    _save_hf_draft(os.path.join(args.savedir, "hf_mid"))
+                deepspeed.comm.barrier()
             # AL early-stop check at mid-save points (needs a filled window).
             stop_dev = (torch.device("cuda", rank)
                         if torch.cuda.is_available() else torch.device("cpu"))
@@ -807,10 +818,11 @@ for epoch in range(start_epoch, args.num_epochs):
             if not os.path.exists(os.path.join(snap_dir, "config.json")):
                 model_engine.module.draft_model.save_pretrained(snap_dir)
         model.zero_grad()
+        _dev = torch.device("cuda", rank) if torch.cuda.is_available() else rank
         fwd_kwargs = dict(
-            input_ids=data["input_ids"].to(rank),
-            attention_mask=data["attention_mask"].to(rank),
-            loss_mask=data["loss_mask"].to(rank),
+            input_ids=data["input_ids"].to(_dev, non_blocking=True),
+            attention_mask=data["attention_mask"].to(_dev, non_blocking=True),
+            loss_mask=data["loss_mask"].to(_dev, non_blocking=True),
             anchor_kl_coef=args.anchor_kl_coef,
             eal_aux_coef=args.eal_aux_coef,
             temperature=args.temperature,

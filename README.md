@@ -30,6 +30,32 @@ JSONL schema for train/val: one object per line with `id` and `conversations` (S
 **Sample tree EAL** (`sample_rsd`):  
 `--eal_mode sample_rsd --path_topk 4 --n_anchors 4 --anchor_kl_coef 0.1` (train loss = dense residual TV `Σ min(u,q)` under RSD; no RL / no `srsd_grad_mode`). Eval = `--draft-mode sample --verify-mode rsd --path-topk 4`.
 
+### KL=0 fair compare (Tree EAL vs Chain EAL vs Pure KL)
+
+When EAL+KL underperforms pure KL, isolate the EAL signal with **KL coefficient = 0** on a smaller mixed set so Tree EAL × 3 epochs finishes in **&lt;8h** on 2 GPUs:
+
+| Piece | Path / recipe |
+|---|---|
+| **Mix builder** | `sdpo/scripts/tree_eal/build_mix_sg_gsm_he_mt.py` |
+| **Prep sbatch** | `sdpo/slurm/tree_eal/prep_mix_sg_gsm_he_mt.sbatch` (1 GPU; regenerates MT-Bench turn-1 with the target) |
+| **Train sbatch** | `sdpo/slurm/tree_eal/train_kl0_trio.sbatch` (`METHOD=tree_eal\|chain_eal\|kl`) |
+| **One-shot submit** | `sdpo/scripts/tree_eal/submit_kl0_trio.sh` |
+| **Default mix** | `/scratch/.../data/mix_sg_gsm_he_mt_4k5.jsonl` ≈ **3600 ShareGPT + 600 GSM8K + 82 HumanEval + 80 MT-Bench** |
+
+| Method | Loss | Key flags |
+|---|---|---|
+| **Tree EAL** | sample_rsd dense residual TV | `--anchor_kl_coef 0 --eal_aux_coef 1 --n_anchors 8 --path_topk 4` |
+| **Chain EAL** | `al_tv` | `--anchor none --aux_loss al_tv --sigmoid_coef 1` |
+| **Pure KL** | position KL | `--anchor kl --aux_loss none` |
+
+```bash
+bash sdpo/scripts/tree_eal/submit_kl0_trio.sh
+# or manually:
+# PREP=$(sbatch --parsable sdpo/slurm/tree_eal/prep_mix_sg_gsm_he_mt.sbatch)
+# sbatch --dependency=afterok:$PREP --export=ALL,METHOD=tree_eal \
+#   sdpo/slurm/tree_eal/train_kl0_trio.sbatch
+```
+
 ## Loss menu (`--anchor` × `--aux_loss`)
 
 | Loss combo | `--anchor` | `--aux_loss` | `SIGMOID_COEF` | Other notes |
